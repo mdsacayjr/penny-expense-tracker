@@ -30,6 +30,12 @@ jobs:
       - name: Install Dependencies
         run: flutter pub get
 
+      # ==========================================================
+      # HIGHLIGHT: Automatically generate Android home screen icon
+      # ==========================================================
+      - name: Generate App Launcher Icons
+        run: dart run flutter_launcher_icons
+
       - name: Build APK
         run: flutter build apk --release
 
