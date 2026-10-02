@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
@@ -130,12 +131,32 @@ class ChatMessage {
 }
 
 // ==========================================
-// 2. LOCAL SQLITE DATABASE
+// 2. UNIVERSAL STORAGE (SQLITE ON ANDROID, WEB STORE ON IPHONE)
 // ==========================================
 
 class AppDatabase {
   static final AppDatabase instance = AppDatabase._init();
   static Database? _database;
+
+  // Web Fallback Data
+  static final Map<String, String> _webSettings = {
+    'monthly_budget': '20000.0',
+    'currency': '₱',
+    'dark_mode': '0',
+  };
+
+  static final List<Category> _webCategories = [
+    const Category(id: 1, name: 'Food & Dining', iconCodePoint: 0xe532, colorValue: 0xFFFF7043, monthlyBudget: 5000.0, isExpense: true),
+    const Category(id: 2, name: 'Groceries', iconCodePoint: 0xe3ab, colorValue: 0xFF66BB6A, monthlyBudget: 4000.0, isExpense: true),
+    const Category(id: 3, name: 'Transportation', iconCodePoint: 0xe1d7, colorValue: 0xFF42A5F5, monthlyBudget: 2500.0, isExpense: true),
+    const Category(id: 4, name: 'Utilities & Bills', iconCodePoint: 0xe56c, colorValue: 0xFFFFA726, monthlyBudget: 3500.0, isExpense: true),
+    const Category(id: 5, name: 'Entertainment', iconCodePoint: 0xe40f, colorValue: 0xFFAB47BC, monthlyBudget: 2000.0, isExpense: true),
+    const Category(id: 6, name: 'Health & Care', iconCodePoint: 0xe3e3, colorValue: 0xFFEF5350, monthlyBudget: 1500.0, isExpense: true),
+    const Category(id: 7, name: 'Salary / Income', iconCodePoint: 0xe041, colorValue: 0xFF26A69A, monthlyBudget: 0.0, isExpense: false),
+  ];
+
+  static final List<ExpenseTransaction> _webTransactions = [];
+  static final List<ChatMessage> _webChatMessages = [];
 
   AppDatabase._init();
 
@@ -152,13 +173,7 @@ class AppDatabase {
   }
 
   Future<void> _createDB(Database db, int version) async {
-    await db.execute('''
-      CREATE TABLE settings (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      )
-    ''');
-
+    await db.execute('CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
     await db.execute('''
       CREATE TABLE categories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -169,7 +184,6 @@ class AppDatabase {
         is_expense INTEGER NOT NULL DEFAULT 1
       )
     ''');
-
     await db.execute('''
       CREATE TABLE transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -183,7 +197,6 @@ class AppDatabase {
         FOREIGN KEY (category_id) REFERENCES categories (id) ON DELETE CASCADE
       )
     ''');
-
     await db.execute('''
       CREATE TABLE chat_messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -192,29 +205,19 @@ class AppDatabase {
         timestamp INTEGER NOT NULL
       )
     ''');
-
     await db.execute('CREATE INDEX idx_tx_date ON transactions(date)');
 
     await db.insert('settings', {'key': 'monthly_budget', 'value': '20000.0'});
     await db.insert('settings', {'key': 'currency', 'value': '₱'});
     await db.insert('settings', {'key': 'dark_mode', 'value': '0'});
 
-    final defaultCategories = [
-      {'name': 'Food & Dining', 'icon_code_point': 0xe532, 'color_value': 0xFFFF7043, 'monthly_budget': 5000.0, 'is_expense': 1},
-      {'name': 'Groceries', 'icon_code_point': 0xe3ab, 'color_value': 0xFF66BB6A, 'monthly_budget': 4000.0, 'is_expense': 1},
-      {'name': 'Transportation', 'icon_code_point': 0xe1d7, 'color_value': 0xFF42A5F5, 'monthly_budget': 2500.0, 'is_expense': 1},
-      {'name': 'Utilities & Bills', 'icon_code_point': 0xe56c, 'color_value': 0xFFFFA726, 'monthly_budget': 3500.0, 'is_expense': 1},
-      {'name': 'Entertainment', 'icon_code_point': 0xe40f, 'color_value': 0xFFAB47BC, 'monthly_budget': 2000.0, 'is_expense': 1},
-      {'name': 'Health & Care', 'icon_code_point': 0xe3e3, 'color_value': 0xFFEF5350, 'monthly_budget': 1500.0, 'is_expense': 1},
-      {'name': 'Salary / Income', 'icon_code_point': 0xe041, 'color_value': 0xFF26A69A, 'monthly_budget': 0.0, 'is_expense': 0},
-    ];
-
-    for (final cat in defaultCategories) {
-      await db.insert('categories', cat);
+    for (final cat in _webCategories) {
+      await db.insert('categories', cat.toMap());
     }
   }
 
   Future<String> getSetting(String key, String defaultValue) async {
+    if (kIsWeb) return _webSettings[key] ?? defaultValue;
     final db = await database;
     final res = await db.query('settings', where: 'key = ?', whereArgs: [key]);
     if (res.isNotEmpty) return res.first['value'] as String;
@@ -222,49 +225,106 @@ class AppDatabase {
   }
 
   Future<void> setSetting(String key, String value) async {
+    if (kIsWeb) {
+      _webSettings[key] = value;
+      return;
+    }
     final db = await database;
     await db.insert('settings', {'key': key, 'value': value}, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   Future<int> insertTransaction(ExpenseTransaction tx) async {
+    if (kIsWeb) {
+      final newTx = ExpenseTransaction(
+        id: _webTransactions.length + 1,
+        title: tx.title,
+        amount: tx.amount,
+        date: tx.date,
+        categoryId: tx.categoryId,
+        isExpense: tx.isExpense,
+        paymentMethod: tx.paymentMethod,
+        note: tx.note,
+      );
+      _webTransactions.insert(0, newTx);
+      return newTx.id!;
+    }
     final db = await database;
     return await db.insert('transactions', tx.toMap());
   }
 
   Future<int> updateTransaction(ExpenseTransaction tx) async {
+    if (kIsWeb) {
+      final index = _webTransactions.indexWhere((t) => t.id == tx.id);
+      if (index != -1) _webTransactions[index] = tx;
+      return 1;
+    }
     final db = await database;
     return await db.update('transactions', tx.toMap(), where: 'id = ?', whereArgs: [tx.id]);
   }
 
   Future<int> deleteTransaction(int id) async {
+    if (kIsWeb) {
+      _webTransactions.removeWhere((t) => t.id == id);
+      return 1;
+    }
     final db = await database;
     return await db.delete('transactions', where: 'id = ?', whereArgs: [id]);
   }
 
   Future<List<ExpenseTransaction>> getAllTransactions({int limit = 200}) async {
+    if (kIsWeb) return List.from(_webTransactions);
     final db = await database;
     final maps = await db.query('transactions', orderBy: 'date DESC', limit: limit);
     return maps.map((e) => ExpenseTransaction.fromMap(e)).toList();
   }
 
   Future<List<Category>> getAllCategories() async {
+    if (kIsWeb) return List.from(_webCategories);
     final db = await database;
     final maps = await db.query('categories', orderBy: 'id ASC');
     return maps.map((e) => Category.fromMap(e)).toList();
   }
 
   Future<int> insertChatMessage(ChatMessage msg) async {
+    if (kIsWeb) {
+      _webChatMessages.add(msg);
+      return _webChatMessages.length;
+    }
     final db = await database;
     return await db.insert('chat_messages', msg.toMap());
   }
 
   Future<List<ChatMessage>> getRecentChatMessages({int limit = 50}) async {
+    if (kIsWeb) return List.from(_webChatMessages);
     final db = await database;
     final maps = await db.query('chat_messages', orderBy: 'timestamp ASC', limit: limit);
     return maps.map((e) => ChatMessage.fromMap(e)).toList();
   }
 
   Future<List<Map<String, dynamic>>> getCategorySpendingSummary(DateTime start, DateTime end) async {
+    if (kIsWeb) {
+      final Map<int, double> catTotals = {};
+      for (final tx in _webTransactions) {
+        if (tx.isExpense && tx.date.isAfter(start) && tx.date.isBefore(end.add(const Duration(days: 1)))) {
+          catTotals[tx.categoryId] = (catTotals[tx.categoryId] ?? 0.0) + tx.amount;
+        }
+      }
+      final List<Map<String, dynamic>> summary = [];
+      for (final cat in _webCategories) {
+        final spent = catTotals[cat.id] ?? 0.0;
+        if (spent > 0) {
+          summary.add({
+            'category_id': cat.id,
+            'category_name': cat.name,
+            'budget': cat.monthlyBudget,
+            'color': cat.colorValue,
+            'total_spent': spent,
+          });
+        }
+      }
+      summary.sort((a, b) => (b['total_spent'] as double).compareTo(a['total_spent'] as double));
+      return summary;
+    }
     final db = await database;
     return await db.rawQuery('''
       SELECT 
@@ -282,6 +342,11 @@ class AppDatabase {
   }
 
   Future<ExpenseTransaction?> getHighestExpense() async {
+    if (kIsWeb) {
+      if (_webTransactions.isEmpty) return null;
+      final sorted = List<ExpenseTransaction>.from(_webTransactions)..sort((a, b) => b.amount.compareTo(a.amount));
+      return sorted.first;
+    }
     final db = await database;
     final maps = await db.query('transactions', where: 'is_expense = 1', orderBy: 'amount DESC', limit: 1);
     if (maps.isNotEmpty) return ExpenseTransaction.fromMap(maps.first);
@@ -672,9 +737,6 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
 
     return Scaffold(
       appBar: AppBar(
-        // ==========================================================
-        // HIGHLIGHT: Custom Avatar Icon in the Top Bar (AI Tab)
-        // ==========================================================
         title: Row(
           children: [
             if (_currentIndex == 2) ...[
@@ -712,9 +774,6 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
         destinations: const [
           NavigationDestination(icon: Icon(Icons.dashboard_outlined), selectedIcon: Icon(Icons.dashboard), label: 'Dashboard'),
           NavigationDestination(icon: Icon(Icons.receipt_long_outlined), selectedIcon: Icon(Icons.receipt_long), label: 'Transactions'),
-          // ==========================================================
-          // HIGHLIGHT: Custom Avatar Icon in Bottom Navigation Bar
-          // ==========================================================
           NavigationDestination(
             icon: CircleAvatar(radius: 12, backgroundImage: AssetImage('icon.png')),
             selectedIcon: CircleAvatar(radius: 12, backgroundImage: AssetImage('icon.png')),
@@ -1184,14 +1243,8 @@ class _AiChatScreenState extends State<AiChatScreen> {
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    // ==========================================================
-                    // HIGHLIGHT: Custom Avatar Icon next to Penny's Responses
-                    // ==========================================================
                     if (!isUser) ...[
-                      const CircleAvatar(
-                        radius: 14,
-                        backgroundImage: AssetImage('icon.png'),
-                      ),
+                      const CircleAvatar(radius: 14, backgroundImage: AssetImage('icon.png')),
                       const SizedBox(width: 8),
                     ],
                     Flexible(
