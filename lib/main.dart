@@ -1,16 +1,34 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 import 'package:fl_chart/fl_chart.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart' as p;
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  runApp(const OfflineExpenseApp());
+  // Load storage + saved theme/currency BEFORE the first frame (no light-mode flash).
+  await AppDatabase.instance.init();
+  final dark = await AppDatabase.instance.getSetting('dark_mode', '0');
+  final cur = await AppDatabase.instance.getSetting('currency', '₱');
+  runApp(OfflineExpenseApp(initialDark: dark == '1', initialCurrency: cur));
 }
+
+// ==========================================
+// 0. SMALL HELPERS
+// ==========================================
+
+String _money(double v) => NumberFormat('#,##0.00').format(v);
+
+/// Half-open range [start of month, start of next month).
+DateTimeRange monthRange(DateTime ref) => DateTimeRange(
+      start: DateTime(ref.year, ref.month, 1),
+      end: DateTime(ref.year, ref.month + 1, 1),
+    );
 
 // ==========================================
 // 1. DATA MODELS
@@ -131,14 +149,18 @@ class ChatMessage {
 }
 
 // ==========================================
-// 2. UNIVERSAL STORAGE (SQLITE ON ANDROID, WEB STORE ON IPHONE)
+// 2. UNIVERSAL STORAGE
+//    SQLite on mobile, SharedPreferences-backed store on web
 // ==========================================
 
 class AppDatabase {
   static final AppDatabase instance = AppDatabase._init();
-  static Database? _database;
+  Future<Database>? _dbFuture; // cached so concurrent callers never open twice
 
-  // Web Fallback Data
+  // ---- Web fallback (persisted in SharedPreferences) ----
+  static SharedPreferences? _prefs;
+  static int _webNextTxId = 1;
+
   static final Map<String, String> _webSettings = {
     'monthly_budget': '20000.0',
     'currency': '₱',
@@ -160,16 +182,74 @@ class AppDatabase {
 
   AppDatabase._init();
 
-  Future<Database> get database async {
-    if (_database != null) return _database!;
-    _database = await _initDB('expense_tracker_v3.db');
-    return _database!;
+  /// Call once from main(): opens SQLite on mobile, loads saved data on web.
+  Future<void> init() async {
+    if (kIsWeb) {
+      _prefs = await SharedPreferences.getInstance();
+      _loadWebState();
+    } else {
+      await database;
+    }
   }
+
+  void _loadWebState() {
+    final prefs = _prefs;
+    if (prefs == null) return;
+    try {
+      final s = prefs.getString('web_settings');
+      if (s != null) {
+        _webSettings.addAll(Map<String, String>.from(jsonDecode(s) as Map));
+      }
+      final t = prefs.getString('web_transactions');
+      if (t != null) {
+        _webTransactions
+          ..clear()
+          ..addAll((jsonDecode(t) as List).map((e) => ExpenseTransaction.fromMap(Map<String, dynamic>.from(e as Map))));
+      }
+      final c = prefs.getString('web_chat');
+      if (c != null) {
+        _webChatMessages
+          ..clear()
+          ..addAll((jsonDecode(c) as List).map((e) => ChatMessage.fromMap(Map<String, dynamic>.from(e as Map))));
+      }
+    } catch (e) {
+      debugPrint('Failed to load web state: $e');
+    }
+    var maxId = 0;
+    for (final tx in _webTransactions) {
+      if ((tx.id ?? 0) > maxId) maxId = tx.id!;
+    }
+    _webNextTxId = maxId + 1;
+  }
+
+  Future<void> _saveWeb() async {
+    final prefs = _prefs;
+    if (prefs == null) return;
+    if (_webChatMessages.length > 200) {
+      _webChatMessages.removeRange(0, _webChatMessages.length - 200);
+    }
+    await prefs.setString('web_settings', jsonEncode(_webSettings));
+    await prefs.setString('web_transactions', jsonEncode(_webTransactions.map((e) => e.toMap()).toList()));
+    await prefs.setString('web_chat', jsonEncode(_webChatMessages.map((e) => e.toMap()).toList()));
+  }
+
+  // ---- SQLite ----
+  Future<Database> get database => _dbFuture ??= _initDB('expense_tracker_v3.db');
 
   Future<Database> _initDB(String filePath) async {
     final dbPath = await getDatabasesPath();
     final fullPath = p.join(dbPath, filePath);
-    return await openDatabase(fullPath, version: 1, onCreate: _createDB);
+    return await openDatabase(
+      fullPath,
+      version: 2,
+      onConfigure: (db) async => await db.execute('PRAGMA foreign_keys = ON'),
+      onCreate: _createDB,
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          await db.execute('CREATE INDEX IF NOT EXISTS idx_tx_category ON transactions(category_id)');
+        }
+      },
+    );
   }
 
   Future<void> _createDB(Database db, int version) async {
@@ -206,6 +286,7 @@ class AppDatabase {
       )
     ''');
     await db.execute('CREATE INDEX idx_tx_date ON transactions(date)');
+    await db.execute('CREATE INDEX idx_tx_category ON transactions(category_id)');
 
     await db.insert('settings', {'key': 'monthly_budget', 'value': '20000.0'});
     await db.insert('settings', {'key': 'currency', 'value': '₱'});
@@ -216,6 +297,7 @@ class AppDatabase {
     }
   }
 
+  // ---- Settings ----
   Future<String> getSetting(String key, String defaultValue) async {
     if (kIsWeb) return _webSettings[key] ?? defaultValue;
     final db = await database;
@@ -227,16 +309,21 @@ class AppDatabase {
   Future<void> setSetting(String key, String value) async {
     if (kIsWeb) {
       _webSettings[key] = value;
+      await _saveWeb();
       return;
     }
     final db = await database;
     await db.insert('settings', {'key': key, 'value': value}, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
+  // ---- Transactions ----
+  /// If [tx.id] is set (e.g. re-inserting after "Undo"), that id is kept.
   Future<int> insertTransaction(ExpenseTransaction tx) async {
     if (kIsWeb) {
+      final id = tx.id ?? _webNextTxId;
+      if (id >= _webNextTxId) _webNextTxId = id + 1;
       final newTx = ExpenseTransaction(
-        id: _webTransactions.length + 1,
+        id: id,
         title: tx.title,
         amount: tx.amount,
         date: tx.date,
@@ -246,7 +333,8 @@ class AppDatabase {
         note: tx.note,
       );
       _webTransactions.insert(0, newTx);
-      return newTx.id!;
+      await _saveWeb();
+      return id;
     }
     final db = await database;
     return await db.insert('transactions', tx.toMap());
@@ -256,6 +344,7 @@ class AppDatabase {
     if (kIsWeb) {
       final index = _webTransactions.indexWhere((t) => t.id == tx.id);
       if (index != -1) _webTransactions[index] = tx;
+      await _saveWeb();
       return 1;
     }
     final db = await database;
@@ -265,6 +354,7 @@ class AppDatabase {
   Future<int> deleteTransaction(int id) async {
     if (kIsWeb) {
       _webTransactions.removeWhere((t) => t.id == id);
+      await _saveWeb();
       return 1;
     }
     final db = await database;
@@ -272,7 +362,10 @@ class AppDatabase {
   }
 
   Future<List<ExpenseTransaction>> getAllTransactions({int limit = 200}) async {
-    if (kIsWeb) return List.from(_webTransactions);
+    if (kIsWeb) {
+      final sorted = List<ExpenseTransaction>.from(_webTransactions)..sort((a, b) => b.date.compareTo(a.date));
+      return sorted.take(limit).toList();
+    }
     final db = await database;
     final maps = await db.query('transactions', orderBy: 'date DESC', limit: limit);
     return maps.map((e) => ExpenseTransaction.fromMap(e)).toList();
@@ -285,27 +378,34 @@ class AppDatabase {
     return maps.map((e) => Category.fromMap(e)).toList();
   }
 
+  // ---- Chat ----
   Future<int> insertChatMessage(ChatMessage msg) async {
     if (kIsWeb) {
       _webChatMessages.add(msg);
+      await _saveWeb();
       return _webChatMessages.length;
     }
     final db = await database;
     return await db.insert('chat_messages', msg.toMap());
   }
 
+  /// Returns the most RECENT [limit] messages, oldest-first.
   Future<List<ChatMessage>> getRecentChatMessages({int limit = 50}) async {
-    if (kIsWeb) return List.from(_webChatMessages);
+    if (kIsWeb) {
+      final all = List<ChatMessage>.from(_webChatMessages);
+      return all.length > limit ? all.sublist(all.length - limit) : all;
+    }
     final db = await database;
-    final maps = await db.query('chat_messages', orderBy: 'timestamp ASC', limit: limit);
-    return maps.map((e) => ChatMessage.fromMap(e)).toList();
+    final maps = await db.query('chat_messages', orderBy: 'timestamp DESC', limit: limit);
+    return maps.map((e) => ChatMessage.fromMap(e)).toList().reversed.toList();
   }
 
-  Future<List<Map<String, dynamic>>> getCategorySpendingSummary(DateTime start, DateTime end) async {
+  // ---- Reports (range is half-open: start <= date < end) ----
+  Future<List<Map<String, dynamic>>> getCategorySpendingSummary(DateTimeRange range) async {
     if (kIsWeb) {
       final Map<int, double> catTotals = {};
       for (final tx in _webTransactions) {
-        if (tx.isExpense && tx.date.isAfter(start) && tx.date.isBefore(end.add(const Duration(days: 1)))) {
+        if (tx.isExpense && !tx.date.isBefore(range.start) && tx.date.isBefore(range.end)) {
           catTotals[tx.categoryId] = (catTotals[tx.categoryId] ?? 0.0) + tx.amount;
         }
       }
@@ -335,20 +435,28 @@ class AppDatabase {
         SUM(t.amount) AS total_spent
       FROM transactions t
       JOIN categories c ON t.category_id = c.id
-      WHERE t.is_expense = 1 AND t.date >= ? AND t.date <= ?
+      WHERE t.is_expense = 1 AND t.date >= ? AND t.date < ?
       GROUP BY c.id
       ORDER BY total_spent DESC
-    ''', [start.millisecondsSinceEpoch, end.millisecondsSinceEpoch]);
+    ''', [range.start.millisecondsSinceEpoch, range.end.millisecondsSinceEpoch]);
   }
 
-  Future<ExpenseTransaction?> getHighestExpense() async {
+  Future<ExpenseTransaction?> getHighestExpense(DateTimeRange range) async {
     if (kIsWeb) {
-      if (_webTransactions.isEmpty) return null;
-      final sorted = List<ExpenseTransaction>.from(_webTransactions)..sort((a, b) => b.amount.compareTo(a.amount));
-      return sorted.first;
+      final inRange = _webTransactions
+          .where((t) => t.isExpense && !t.date.isBefore(range.start) && t.date.isBefore(range.end))
+          .toList()
+        ..sort((a, b) => b.amount.compareTo(a.amount));
+      return inRange.isEmpty ? null : inRange.first;
     }
     final db = await database;
-    final maps = await db.query('transactions', where: 'is_expense = 1', orderBy: 'amount DESC', limit: 1);
+    final maps = await db.query(
+      'transactions',
+      where: 'is_expense = 1 AND date >= ? AND date < ?',
+      whereArgs: [range.start.millisecondsSinceEpoch, range.end.millisecondsSinceEpoch],
+      orderBy: 'amount DESC',
+      limit: 1,
+    );
     if (maps.isNotEmpty) return ExpenseTransaction.fromMap(maps.first);
     return null;
   }
@@ -358,192 +466,229 @@ class AppDatabase {
 // 3. AI ADVISOR & NATURAL LANGUAGE PARSER
 // ==========================================
 
+/// An expense Penny is not sure about — the user must confirm it first.
+class PendingExpense {
+  final String title;
+  final double amount;
+  const PendingExpense(this.title, this.amount);
+}
+
+class AdvisorReply {
+  final String text;
+  final int? loggedTxId; // set when an expense was actually saved (enables Undo)
+  final PendingExpense? pending; // set when Penny asks "log this?"
+  const AdvisorReply(this.text, {this.loggedTxId, this.pending});
+}
+
+class _ParsedExpense {
+  final String title;
+  final double amount;
+  final bool confident; // true only when a clear verb like "spent/paid/bought/add" was used
+  const _ParsedExpense(this.title, this.amount, this.confident);
+}
+
+class _MonthStats {
+  final String currency;
+  final double budget;
+  final double spent;
+  final List<Map<String, dynamic>> summary;
+  const _MonthStats(this.currency, this.budget, this.spent, this.summary);
+  double get remaining => budget - spent;
+}
+
 class AiAdvisorService {
-  static Future<Map<String, dynamic>> processUserMessage(String userQuery) async {
+  static final RegExp _offTopic = RegExp(r'\b(?:python|javascript|write code|who won|jokes?|weather|recipes?)\b');
+  static final RegExp _questionStart = RegExp(r'^(?:what|how|when|where|why|who|which|show|can|could|do|does|did|is|are|am)\b');
+  static final RegExp _nonTitles = RegExp(r'\b(?:summary|budget|afford|save|money|allowance|left|remaining|highest|biggest)\b');
+
+  static Future<_MonthStats> _stats() async {
+    final currency = await AppDatabase.instance.getSetting('currency', '₱');
+    final budgetStr = await AppDatabase.instance.getSetting('monthly_budget', '20000.0');
+    final budget = double.tryParse(budgetStr) ?? 20000.0;
+    final summary = await AppDatabase.instance.getCategorySpendingSummary(monthRange(DateTime.now()));
+    double spent = 0;
+    for (final row in summary) {
+      spent += (row['total_spent'] as num).toDouble();
+    }
+    return _MonthStats(currency, budget, spent, summary);
+  }
+
+  /// Saves the expense and returns a reply that carries the new id (for Undo).
+  static Future<AdvisorReply> logExpense(String rawTitle, double amount) async {
+    final categories = await AppDatabase.instance.getAllCategories();
+    final category = _detectCategory(rawTitle, categories);
+    final title = rawTitle[0].toUpperCase() + rawTitle.substring(1);
+
+    final id = await AppDatabase.instance.insertTransaction(ExpenseTransaction(
+      title: title,
+      amount: amount,
+      date: DateTime.now(),
+      categoryId: category.id!,
+      paymentMethod: 'Cash',
+    ));
+
+    final s = await _stats();
+    return AdvisorReply(
+      "✅ **Expense Logged!**\n"
+      "• Item: **$title**\n"
+      "• Amount: **${s.currency}${amount.toStringAsFixed(2)}**\n"
+      "• Category: **${category.name}**\n\n"
+      "💰 Your remaining budget is now **${s.currency}${_money(s.remaining)}**.",
+      loggedTxId: id,
+    );
+  }
+
+  static Future<AdvisorReply> processUserMessage(String userQuery) async {
     final lower = userQuery.toLowerCase().trim();
 
-    final offTopicKeywords = ['python', 'javascript', 'write code', 'who won', 'joke', 'weather', 'recipe', 'history'];
-    for (final word in offTopicKeywords) {
-      if (lower.contains(word)) {
-        return {
-          'text': "I am Penny, your personal offline expense assistant. I am strictly dedicated to your budget, transactions, and money decisions.",
-          'loggedExpense': false,
-        };
-      }
+    if (_offTopic.hasMatch(lower)) {
+      return const AdvisorReply(
+          "I am Penny, your personal offline expense assistant. I am strictly dedicated to your budget, transactions, and money decisions.");
     }
 
-    final logMatch = _tryParseExpense(userQuery);
-    if (logMatch != null) {
-      final amount = logMatch['amount'] as double;
-      final rawTitle = logMatch['title'] as String;
-
-      final categories = await AppDatabase.instance.getAllCategories();
-      final category = _detectCategory(rawTitle, categories);
-
-      final newTx = ExpenseTransaction(
-        title: rawTitle[0].toUpperCase() + rawTitle.substring(1),
-        amount: amount,
-        date: DateTime.now(),
-        categoryId: category.id!,
-        paymentMethod: 'Cash',
-      );
-
-      await AppDatabase.instance.insertTransaction(newTx);
-
-      final currency = await AppDatabase.instance.getSetting('currency', '₱');
-      final budgetStr = await AppDatabase.instance.getSetting('monthly_budget', '20000.0');
-      final totalBudget = double.tryParse(budgetStr) ?? 20000.0;
-
-      final now = DateTime.now();
-      final summary = await AppDatabase.instance.getCategorySpendingSummary(DateTime(now.year, now.month, 1), now);
-      double totalSpent = 0;
-      for (var row in summary) {
-        totalSpent += (row['total_spent'] as num).toDouble();
+    final parsed = _tryParseExpense(userQuery);
+    if (parsed != null) {
+      if (parsed.confident) {
+        return logExpense(parsed.title, parsed.amount);
       }
-      final remaining = totalBudget - totalSpent;
-
-      return {
-        'text': "✅ **Expense Logged!**\n"
-            "• Item: **${newTx.title}**\n"
-            "• Amount: **$currency${amount.toStringAsFixed(2)}**\n"
-            "• Category: **${category.name}**\n\n"
-            "💰 Your remaining budget is now **$currency${NumberFormat("#,##0.00").format(remaining)}**.",
-        'loggedExpense': true,
-      };
+      final currency = await AppDatabase.instance.getSetting('currency', '₱');
+      return AdvisorReply(
+        "🤔 Did you want me to log **${parsed.title}** for **$currency${_money(parsed.amount)}**?",
+        pending: PendingExpense(parsed.title, parsed.amount),
+      );
     }
 
     if (lower.contains('daily') || lower.contains('allowance') || lower.contains('per day')) {
       final now = DateTime.now();
       final daysInMonth = DateTime(now.year, now.month + 1, 0).day;
       final daysLeft = (daysInMonth - now.day) + 1;
+      final s = await _stats();
+      final dailyAllowance = s.remaining > 0 ? (s.remaining / daysLeft) : 0.0;
 
-      final currency = await AppDatabase.instance.getSetting('currency', '₱');
-      final budgetStr = await AppDatabase.instance.getSetting('monthly_budget', '20000.0');
-      final totalBudget = double.tryParse(budgetStr) ?? 20000.0;
-
-      final summary = await AppDatabase.instance.getCategorySpendingSummary(DateTime(now.year, now.month, 1), now);
-      double totalSpent = 0;
-      for (var row in summary) {
-        totalSpent += (row['total_spent'] as num).toDouble();
-      }
-      final remaining = totalBudget - totalSpent;
-      final dailyAllowance = remaining > 0 ? (remaining / daysLeft) : 0.0;
-
-      return {
-        'text': "📅 **Daily Allowance Breakdown:**\n\n"
-            "• Days remaining this month: **$daysLeft days**\n"
-            "• Total remaining money: **$currency${NumberFormat("#,##0.00").format(remaining)}**\n"
-            "• **Safe Daily Limit:** **$currency${NumberFormat("#,##0.00").format(dailyAllowance)} / day**\n\n"
-            "${remaining <= 0 ? "⚠️ You have exceeded your monthly budget! Try to pause discretionary spending." : "Stick to this daily amount to comfortably hit your monthly budget!"}",
-        'loggedExpense': false,
-      };
+      return AdvisorReply(
+        "📅 **Daily Allowance Breakdown:**\n\n"
+        "• Days remaining this month: **$daysLeft days**\n"
+        "• Total remaining money: **${s.currency}${_money(s.remaining)}**\n"
+        "• **Safe Daily Limit:** **${s.currency}${_money(dailyAllowance)} / day**\n\n"
+        "${s.remaining <= 0 ? "⚠️ You have exceeded your monthly budget! Try to pause discretionary spending." : "Stick to this daily amount to comfortably hit your monthly budget!"}",
+      );
     }
 
     if (lower.contains('highest') || lower.contains('biggest')) {
       final currency = await AppDatabase.instance.getSetting('currency', '₱');
-      final highest = await AppDatabase.instance.getHighestExpense();
+      final highest = await AppDatabase.instance.getHighestExpense(monthRange(DateTime.now()));
       if (highest == null) {
-        return {'text': "You haven't logged any expenses yet this month.", 'loggedExpense': false};
+        return const AdvisorReply("You haven't logged any expenses yet this month.");
       }
-      return {
-        'text': "🔍 Your biggest expense so far is **${highest.title}** for **$currency${NumberFormat("#,##0.00").format(highest.amount)}** on ${DateFormat('MMM dd, yyyy').format(highest.date)}.",
-        'loggedExpense': false,
-      };
+      return AdvisorReply(
+        "🔍 Your biggest expense this month is **${highest.title}** for **$currency${_money(highest.amount)}** on ${DateFormat('MMM dd, yyyy').format(highest.date)}.",
+      );
     }
 
     final categories = await AppDatabase.instance.getAllCategories();
-    for (var cat in categories) {
-      if (lower.contains(cat.name.toLowerCase()) || (cat.name.contains('Food') && lower.contains('food'))) {
-        final now = DateTime.now();
-        final summary = await AppDatabase.instance.getCategorySpendingSummary(DateTime(now.year, now.month, 1), now);
-        final currency = await AppDatabase.instance.getSetting('currency', '₱');
-        final match = summary.firstWhere((m) => m['category_id'] == cat.id, orElse: () => <String, dynamic>{});
+    final words = lower.split(RegExp(r'[^a-z]+')).where((w) => w.length >= 4).toList();
+    for (final cat in categories.where((c) => c.isExpense)) {
+      final tokens = cat.name.toLowerCase().split(RegExp(r'[^a-z]+')).where((t) => t.length >= 4).toList();
+      final hit = words.any((w) => tokens.any((t) => t.startsWith(w) || w.startsWith(t)));
+      if (hit) {
+        final s = await _stats();
+        final match = s.summary.firstWhere((m) => m['category_id'] == cat.id, orElse: () => <String, dynamic>{});
         final spent = match.isNotEmpty ? (match['total_spent'] as num).toDouble() : 0.0;
-        return {
-          'text': "📊 For **${cat.name}**, you have spent **$currency${NumberFormat("#,##0.00").format(spent)}** this month.",
-          'loggedExpense': false,
-        };
+        return AdvisorReply("📊 For **${cat.name}**, you have spent **${s.currency}${_money(spent)}** this month.");
       }
     }
 
-    final currency = await AppDatabase.instance.getSetting('currency', '₱');
-    final budgetStr = await AppDatabase.instance.getSetting('monthly_budget', '20000.0');
-    final totalBudget = double.tryParse(budgetStr) ?? 20000.0;
-
-    final now = DateTime.now();
-    final summary = await AppDatabase.instance.getCategorySpendingSummary(DateTime(now.year, now.month, 1), now);
-    double totalSpent = 0;
-    final categoryLines = <String>[];
-    for (var row in summary) {
-      final name = row['category_name'];
-      final spent = (row['total_spent'] as num).toDouble();
-      totalSpent += spent;
-      categoryLines.add('• $name: $currency${NumberFormat("#,##0.00").format(spent)}');
-    }
-    final remaining = totalBudget - totalSpent;
+    final s = await _stats();
 
     if (lower.contains('afford')) {
-      return {
-        'text': "💡 **Affordability Advice:**\n\n"
-            "• Monthly Budget: **$currency${NumberFormat("#,##0.00").format(totalBudget)}**\n"
-            "• Current Remaining: **$currency${NumberFormat("#,##0.00").format(remaining)}**\n\n"
-            "${remaining > 2000 ? "You have room in your budget for essential needs, but make sure non-essential purchases don't consume your remaining buffer!" : "Your remaining budget is tight ($currency${NumberFormat("#,##0.00").format(remaining)}). Consider holding off on any extra purchases!"}",
-        'loggedExpense': false,
-      };
+      return AdvisorReply(
+        "💡 **Affordability Advice:**\n\n"
+        "• Monthly Budget: **${s.currency}${_money(s.budget)}**\n"
+        "• Current Remaining: **${s.currency}${_money(s.remaining)}**\n\n"
+        "${s.remaining > 2000 ? "You have room in your budget for essential needs, but make sure non-essential purchases don't consume your remaining buffer!" : "Your remaining budget is tight (${s.currency}${_money(s.remaining)}). Consider holding off on any extra purchases!"}",
+      );
     }
 
-    return {
-      'text': "📋 **Current Financial Snapshot:**\n\n"
-          "• Budget: **$currency${NumberFormat("#,##0.00").format(totalBudget)}**\n"
-          "• Total Spent: **$currency${NumberFormat("#,##0.00").format(totalSpent)}**\n"
-          "• Remaining: **$currency${NumberFormat("#,##0.00").format(remaining)}**\n\n"
-          "**Top Categories:**\n"
-          "${categoryLines.isEmpty ? "• No expenses logged yet." : categoryLines.join('\n')}\n\n"
-          "Tip: You can log an expense right here! Just type: *\"Spent 150 on coffee\"*.",
-      'loggedExpense': false,
-    };
+    final categoryLines = s.summary
+        .map((row) => '• ${row['category_name']}: ${s.currency}${_money((row['total_spent'] as num).toDouble())}')
+        .toList();
+
+    return AdvisorReply(
+      "📋 **Current Financial Snapshot:**\n\n"
+      "• Budget: **${s.currency}${_money(s.budget)}**\n"
+      "• Total Spent: **${s.currency}${_money(s.spent)}**\n"
+      "• Remaining: **${s.currency}${_money(s.remaining)}**\n\n"
+      "**Top Categories:**\n"
+      "${categoryLines.isEmpty ? "• No expenses logged yet." : categoryLines.join('\n')}\n\n"
+      "Tip: You can log an expense right here! Just type: *\"Spent 150 on coffee\"*.",
+    );
   }
 
-  static Map<String, dynamic>? _tryParseExpense(String text) {
+  static const String _amt = r'([0-9][0-9,]*(?:\.[0-9]+)?)\s*(k\b)?';
+
+  static double? _toAmount(String raw, String? kSuffix) {
+    final v = double.tryParse(raw.replaceAll(',', ''));
+    if (v == null) return null;
+    return kSuffix != null ? v * 1000 : v;
+  }
+
+  static _ParsedExpense? _tryParseExpense(String text) {
     final cleaned = text.trim();
-    final r1 = RegExp(r'(?:spent|paid|bought|add)\s+(?:[₱\$€£₹])?\s*([0-9]+(?:\.[0-9]+)?)\s+(?:on|for)\s+(.+)', caseSensitive: false);
+    final lower = cleaned.toLowerCase();
+
+    final r1 = RegExp(
+      r'(?:spent|paid|bought|add)\s+(?:[₱\$€£₹])?\s*' + _amt + r'\s+(?:on|for)\s+(.+)',
+      caseSensitive: false,
+    );
     final m1 = r1.firstMatch(cleaned);
-    if (m1 != null) {
-      return {'amount': double.parse(m1.group(1)!), 'title': m1.group(2)!.trim()};
+    if (m1 != null && !cleaned.contains('?')) {
+      final amount = _toAmount(m1.group(1)!, m1.group(2));
+      final title = m1.group(3)!.trim();
+      if (amount != null && amount > 0 && title.isNotEmpty) {
+        return _ParsedExpense(title, amount, true);
+      }
     }
 
-    final r2 = RegExp(r'(.+?)\s+(?:for|cost|was)?\s*(?:[₱\$€£₹])?\s*([0-9]+(?:\.[0-9]+)?)$', caseSensitive: false);
+    if (cleaned.contains('?') || _questionStart.hasMatch(lower)) return null;
+    final r2 = RegExp(
+      r'^(.+?)\s+(?:(?:for|cost|was)\s+)?(?:[₱\$€£₹])?\s*' + _amt + r'$',
+      caseSensitive: false,
+    );
     final m2 = r2.firstMatch(cleaned);
     if (m2 != null) {
       final possibleTitle = m2.group(1)!.trim();
-      final nonTitles = ['summary', 'budget', 'afford', 'save', 'money', 'allowance', 'left', 'remaining', 'highest'];
-      if (!nonTitles.any((w) => possibleTitle.toLowerCase().contains(w))) {
-        return {'amount': double.parse(m2.group(2)!), 'title': possibleTitle};
+      final amount = _toAmount(m2.group(2)!, m2.group(3));
+      if (amount != null && amount > 0 && possibleTitle.isNotEmpty && !_nonTitles.hasMatch(possibleTitle.toLowerCase())) {
+        return _ParsedExpense(possibleTitle, amount, false);
       }
     }
     return null;
   }
 
+  static final Map<String, RegExp> _categoryRules = {
+    'Groceries': RegExp(r'\b(?:grocer(?:y|ies)|market|milk|eggs?|meat|fruits?|veg(?:gies|etables?)?|rice)\b'),
+    'Transportation': RegExp(r'\b(?:taxi|bus|fare|gas|fuel|train|grab|angkas|car|jeep(?:ney)?|toll|parking|mrt|lrt)\b'),
+    'Utilities & Bills': RegExp(r'\b(?:bills?|electric(?:ity)?|water|internet|wifi|phone|rent)\b'),
+    'Entertainment': RegExp(r'\b(?:movies?|games?|netflix|spotify|concert|party)\b'),
+    'Health & Care': RegExp(r'\b(?:meds?|medicine|doctor|drugs?|clinic|health|hospital|pharmacy|vitamins?)\b'),
+  };
+
   static Category _detectCategory(String title, List<Category> categories) {
     final t = title.toLowerCase();
-    int targetIcon = 0xe532;
-
-    if (t.contains('grocer') || t.contains('market') || t.contains('milk') || t.contains('egg') || t.contains('meat') || t.contains('fruit') || t.contains('veg')) {
-      targetIcon = 0xe3ab;
-    } else if (t.contains('taxi') || t.contains('bus') || t.contains('fare') || t.contains('gas') || t.contains('fuel') || t.contains('train') || t.contains('grab') || t.contains('angkas') || t.contains('car')) {
-      targetIcon = 0xe1d7;
-    } else if (t.contains('bill') || t.contains('electric') || t.contains('water') || t.contains('internet') || t.contains('wifi') || t.contains('phone') || t.contains('rent')) {
-      targetIcon = 0xe56c;
-    } else if (t.contains('movie') || t.contains('game') || t.contains('netflix') || t.contains('concert') || t.contains('party') || t.contains('drink')) {
-      targetIcon = 0xe40f;
-    } else if (t.contains('med') || t.contains('doctor') || t.contains('drug') || t.contains('clinic') || t.contains('health') || t.contains('hospital')) {
-      targetIcon = 0xe3e3;
+    String? target;
+    for (final e in _categoryRules.entries) {
+      if (e.value.hasMatch(t)) {
+        target = e.key;
+        break;
+      }
     }
-
-    return categories.firstWhere(
-      (c) => c.iconCodePoint == targetIcon,
-      orElse: () => categories.firstWhere((c) => c.isExpense, orElse: () => categories.first),
-    );
+    final expenseCats = categories.where((c) => c.isExpense).toList();
+    if (target != null) {
+      for (final c in expenseCats) {
+        if (c.name == target) return c;
+      }
+    }
+    return expenseCats.isNotEmpty ? expenseCats.first : categories.first;
   }
 }
 
@@ -552,7 +697,9 @@ class AiAdvisorService {
 // ==========================================
 
 class OfflineExpenseApp extends StatefulWidget {
-  const OfflineExpenseApp({super.key});
+  final bool initialDark;
+  final String initialCurrency;
+  const OfflineExpenseApp({super.key, this.initialDark = false, this.initialCurrency = '₱'});
 
   static _OfflineExpenseAppState? of(BuildContext context) =>
       context.findAncestorStateOfType<_OfflineExpenseAppState>();
@@ -562,22 +709,14 @@ class OfflineExpenseApp extends StatefulWidget {
 }
 
 class _OfflineExpenseAppState extends State<OfflineExpenseApp> {
-  ThemeMode _themeMode = ThemeMode.light;
-  String _currency = '₱';
+  late ThemeMode _themeMode;
+  late String _currency;
 
   @override
   void initState() {
     super.initState();
-    _loadPreferences();
-  }
-
-  Future<void> _loadPreferences() async {
-    final darkVal = await AppDatabase.instance.getSetting('dark_mode', '0');
-    final curVal = await AppDatabase.instance.getSetting('currency', '₱');
-    setState(() {
-      _themeMode = darkVal == '1' ? ThemeMode.dark : ThemeMode.light;
-      _currency = curVal;
-    });
+    _themeMode = widget.initialDark ? ThemeMode.dark : ThemeMode.light;
+    _currency = widget.initialCurrency;
   }
 
   void toggleTheme() async {
@@ -628,7 +767,7 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
   void _refreshAll() {
     _dashboardKey.currentState?.loadData();
     _txKey.currentState?.load();
-    setState(() {});
+    if (mounted) setState(() {});
   }
 
   void _openAddTransactionModal([ExpenseTransaction? existing]) async {
@@ -671,6 +810,8 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
     );
   }
 
+  String _csv(String s) => s.replaceAll('"', '""');
+
   void _exportCSV() async {
     final list = await AppDatabase.instance.getAllTransactions();
     final categories = await AppDatabase.instance.getAllCategories();
@@ -681,7 +822,7 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
     for (var tx in list) {
       final cat = catMap[tx.categoryId] ?? 'General';
       final dt = DateFormat('yyyy-MM-dd HH:mm').format(tx.date);
-      buffer.writeln('${tx.id},"$dt","${tx.title}","$cat",${tx.amount},"${tx.paymentMethod}","${tx.note ?? ''}"');
+      buffer.writeln('${tx.id},"$dt","${_csv(tx.title)}","${_csv(cat)}",${tx.amount},"${_csv(tx.paymentMethod)}","${_csv(tx.note ?? '')}"');
     }
 
     final csvData = buffer.toString();
@@ -730,8 +871,8 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
   @override
   Widget build(BuildContext context) {
     final screens = [
-      DashboardScreen(key: _dashboardKey, currency: widget.currency, onEdit: _openAddTransactionModal),
-      TransactionsScreen(key: _txKey, currency: widget.currency, onEdit: _openAddTransactionModal),
+      DashboardScreen(key: _dashboardKey, currency: widget.currency, onEdit: _openAddTransactionModal, onChanged: _refreshAll),
+      TransactionsScreen(key: _txKey, currency: widget.currency, onEdit: _openAddTransactionModal, onChanged: _refreshAll),
       AiChatScreen(currency: widget.currency, onExpenseLogged: _refreshAll),
     ];
 
@@ -792,8 +933,9 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
 class DashboardScreen extends StatefulWidget {
   final String currency;
   final Function(ExpenseTransaction) onEdit;
+  final VoidCallback onChanged;
 
-  const DashboardScreen({super.key, required this.currency, required this.onEdit});
+  const DashboardScreen({super.key, required this.currency, required this.onEdit, required this.onChanged});
 
   @override
   State<DashboardScreen> createState() => _DashboardScreenState();
@@ -813,12 +955,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   Future<void> loadData() async {
-    setState(() => _loading = true);
-    final now = DateTime.now();
-    final firstDay = DateTime(now.year, now.month, 1);
+    final range = monthRange(DateTime.now());
 
     final budgetStr = await AppDatabase.instance.getSetting('monthly_budget', '20000.0');
-    final summary = await AppDatabase.instance.getCategorySpendingSummary(firstDay, now);
+    final summary = await AppDatabase.instance.getCategorySpendingSummary(range);
     final recent = await AppDatabase.instance.getAllTransactions(limit: 5);
 
     double total = 0.0;
@@ -856,7 +996,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
           FilledButton(
             onPressed: () async {
-              final newBudget = double.tryParse(controller.text.trim()) ?? _monthlyBudget;
+              final newBudget = double.tryParse(controller.text.trim().replaceAll(',', '')) ?? _monthlyBudget;
               await AppDatabase.instance.setSetting('monthly_budget', newBudget.toString());
               if (mounted) {
                 Navigator.pop(ctx);
@@ -868,6 +1008,25 @@ class _DashboardScreenState extends State<DashboardScreen> {
         ],
       ),
     );
+  }
+
+  Future<void> _deleteWithUndo(ExpenseTransaction tx) async {
+    setState(() => _recent.removeWhere((t) => t.id == tx.id));
+    await AppDatabase.instance.deleteTransaction(tx.id!);
+    widget.onChanged();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(
+        content: Text('Deleted "${tx.title}"'),
+        action: SnackBarAction(
+          label: 'Undo',
+          onPressed: () async {
+            await AppDatabase.instance.insertTransaction(tx);
+            widget.onChanged();
+          },
+        ),
+      ));
   }
 
   @override
@@ -929,7 +1088,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         children: [
                           const Text('Total Spent', style: TextStyle(fontSize: 12)),
                           Text(
-                            '${widget.currency}${NumberFormat("#,##0.00").format(_totalExpenses)}',
+                            '${widget.currency}${_money(_totalExpenses)}',
                             style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                           ),
                         ],
@@ -946,7 +1105,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             ),
                           ),
                           Text(
-                            '${widget.currency}${NumberFormat("#,##0.00").format(remaining.abs())}',
+                            '${widget.currency}${_money(remaining.abs())}',
                             style: TextStyle(
                               fontSize: 20,
                               fontWeight: FontWeight.bold,
@@ -1030,11 +1189,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     color: Colors.red,
                     child: const Icon(Icons.delete, color: Colors.white),
                   ),
-                  onDismissed: (_) async {
-                    await AppDatabase.instance.deleteTransaction(tx.id!);
-                    loadData();
-                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Deleted "${tx.title}"')));
-                  },
+                  onDismissed: (_) => _deleteWithUndo(tx),
                   child: ListTile(
                     contentPadding: EdgeInsets.zero,
                     onTap: () => widget.onEdit(tx),
@@ -1045,7 +1200,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     title: Text(tx.title),
                     subtitle: Text(DateFormat('MMM dd, yyyy').format(tx.date)),
                     trailing: Text(
-                      '-${widget.currency}${NumberFormat("#,##0.00").format(tx.amount)}',
+                      '-${widget.currency}${_money(tx.amount)}',
                       style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.redAccent),
                     ),
                   ),
@@ -1064,8 +1219,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
 class TransactionsScreen extends StatefulWidget {
   final String currency;
   final Function(ExpenseTransaction) onEdit;
+  final VoidCallback onChanged;
 
-  const TransactionsScreen({super.key, required this.currency, required this.onEdit});
+  const TransactionsScreen({super.key, required this.currency, required this.onEdit, required this.onChanged});
 
   @override
   State<TransactionsScreen> createState() => _TransactionsScreenState();
@@ -1082,9 +1238,32 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
   }
 
   Future<void> load() async {
-    setState(() => _loading = true);
     final list = await AppDatabase.instance.getAllTransactions(limit: 200);
-    if (mounted) setState(() { _transactions = list; _loading = false; });
+    if (mounted) {
+      setState(() {
+        _transactions = list;
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _deleteWithUndo(ExpenseTransaction tx) async {
+    setState(() => _transactions.removeWhere((t) => t.id == tx.id));
+    await AppDatabase.instance.deleteTransaction(tx.id!);
+    widget.onChanged();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(
+        content: Text('Deleted "${tx.title}"'),
+        action: SnackBarAction(
+          label: 'Undo',
+          onPressed: () async {
+            await AppDatabase.instance.insertTransaction(tx);
+            widget.onChanged();
+          },
+        ),
+      ));
   }
 
   @override
@@ -1107,17 +1286,13 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
                   color: Colors.red,
                   child: const Icon(Icons.delete, color: Colors.white),
                 ),
-                onDismissed: (_) async {
-                  await AppDatabase.instance.deleteTransaction(tx.id!);
-                  load();
-                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Deleted "${tx.title}"')));
-                },
+                onDismissed: (_) => _deleteWithUndo(tx),
                 child: ListTile(
                   onTap: () => widget.onEdit(tx),
                   title: Text(tx.title),
                   subtitle: Text('${DateFormat('MMM dd, yyyy').format(tx.date)} • ${tx.paymentMethod}'),
                   trailing: Text(
-                    '-${widget.currency}${NumberFormat("#,##0.00").format(tx.amount)}',
+                    '-${widget.currency}${_money(tx.amount)}',
                     style: const TextStyle(color: Colors.redAccent, fontWeight: FontWeight.bold),
                   ),
                 ),
@@ -1131,6 +1306,33 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
 // 7. AI CHAT SCREEN (PENNY)
 // ==========================================
 
+class _RichChatText extends StatelessWidget {
+  final String text;
+  final TextStyle style;
+  final bool markup;
+  const _RichChatText({required this.text, required this.style, required this.markup});
+
+  @override
+  Widget build(BuildContext context) {
+    if (!markup) return Text(text, style: style);
+
+    final spans = <TextSpan>[];
+    final re = RegExp(r'\*\*(.+?)\*\*|\*(.+?)\*');
+    var last = 0;
+    for (final m in re.allMatches(text)) {
+      if (m.start > last) spans.add(TextSpan(text: text.substring(last, m.start)));
+      if (m.group(1) != null) {
+        spans.add(TextSpan(text: m.group(1), style: const TextStyle(fontWeight: FontWeight.bold)));
+      } else {
+        spans.add(TextSpan(text: m.group(2), style: const TextStyle(fontStyle: FontStyle.italic)));
+      }
+      last = m.end;
+    }
+    if (last < text.length) spans.add(TextSpan(text: text.substring(last)));
+    return Text.rich(TextSpan(style: style, children: spans));
+  }
+}
+
 class AiChatScreen extends StatefulWidget {
   final String currency;
   final VoidCallback onExpenseLogged;
@@ -1143,7 +1345,9 @@ class AiChatScreen extends StatefulWidget {
 
 class _AiChatScreenState extends State<AiChatScreen> {
   final TextEditingController _controller = TextEditingController();
+  final ScrollController _scroll = ScrollController();
   final List<ChatMessage> _messages = [];
+  final Map<ChatMessage, PendingExpense> _pending = Map<ChatMessage, PendingExpense>.identity();
   bool _busy = false;
 
   @override
@@ -1152,8 +1356,28 @@ class _AiChatScreenState extends State<AiChatScreen> {
     _loadChat();
   }
 
+  @override
+  void dispose() {
+    _controller.dispose();
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  void _scrollToEnd() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scroll.hasClients) {
+        _scroll.animateTo(
+          _scroll.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 250),
+          curve: Curves.easeOut,
+        );
+      }
+    });
+  }
+
   Future<void> _loadChat() async {
     final history = await AppDatabase.instance.getRecentChatMessages();
+    if (!mounted) return;
     setState(() {
       _messages.addAll(history);
       if (_messages.isEmpty) {
@@ -1168,6 +1392,42 @@ class _AiChatScreenState extends State<AiChatScreen> {
         );
       }
     });
+    _scrollToEnd();
+  }
+
+  Future<void> _addAssistant(AdvisorReply reply) async {
+    final aiMsg = ChatMessage(sender: ChatSender.assistant, content: reply.text, timestamp: DateTime.now());
+    await AppDatabase.instance.insertChatMessage(aiMsg);
+    if (!mounted) return;
+    setState(() {
+      _messages.add(aiMsg);
+      if (reply.pending != null) _pending[aiMsg] = reply.pending!;
+    });
+    _scrollToEnd();
+
+    if (reply.loggedTxId != null) {
+      widget.onExpenseLogged();
+      _showUndo(reply.loggedTxId!);
+    }
+  }
+
+  void _showUndo(int txId) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(
+        content: const Text('Expense logged'),
+        duration: const Duration(seconds: 6),
+        action: SnackBarAction(
+          label: 'Undo',
+          onPressed: () async {
+            await AppDatabase.instance.deleteTransaction(txId);
+            widget.onExpenseLogged();
+            if (mounted) {
+              await _addAssistant(const AdvisorReply('↩️ Undone — that expense was removed.'));
+            }
+          },
+        ),
+      ));
   }
 
   Future<void> _send(String text) async {
@@ -1176,22 +1436,30 @@ class _AiChatScreenState extends State<AiChatScreen> {
     _controller.clear();
 
     final userMsg = ChatMessage(sender: ChatSender.user, content: query, timestamp: DateTime.now());
-    setState(() { _messages.add(userMsg); _busy = true; });
+    setState(() {
+      _messages.add(userMsg);
+      _busy = true;
+    });
+    _scrollToEnd();
     await AppDatabase.instance.insertChatMessage(userMsg);
 
-    final result = await AiAdvisorService.processUserMessage(query);
-    final reply = result['text'] as String;
-    final didLog = result['loggedExpense'] as bool;
+    final reply = await AiAdvisorService.processUserMessage(query);
+    if (mounted) setState(() => _busy = false);
+    await _addAssistant(reply);
+  }
 
-    final aiMsg = ChatMessage(sender: ChatSender.assistant, content: reply, timestamp: DateTime.now());
-    await AppDatabase.instance.insertChatMessage(aiMsg);
+  Future<void> _confirmPending(ChatMessage m) async {
+    final p = _pending.remove(m);
+    if (p == null) return;
+    setState(() {});
+    final reply = await AiAdvisorService.logExpense(p.title, p.amount);
+    await _addAssistant(reply);
+  }
 
-    if (mounted) {
-      setState(() { _messages.add(aiMsg); _busy = false; });
-      if (didLog) {
-        widget.onExpenseLogged();
-      }
-    }
+  Future<void> _cancelPending(ChatMessage m) async {
+    if (_pending.remove(m) == null) return;
+    setState(() {});
+    await _addAssistant(const AdvisorReply("No problem — I didn't log anything."));
   }
 
   @override
@@ -1232,41 +1500,66 @@ class _AiChatScreenState extends State<AiChatScreen> {
         const Divider(height: 1),
         Expanded(
           child: ListView.builder(
+            controller: _scroll,
             padding: const EdgeInsets.all(16),
             itemCount: _messages.length,
             itemBuilder: (context, i) {
               final m = _messages[i];
               final isUser = m.sender == ChatSender.user;
-              return Align(
-                alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    if (!isUser) ...[
-                      const CircleAvatar(radius: 14, backgroundImage: AssetImage('icon.png')),
-                      const SizedBox(width: 8),
-                    ],
-                    Flexible(
-                      child: Container(
-                        margin: const EdgeInsets.symmetric(vertical: 4),
-                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                        constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
-                        decoration: BoxDecoration(
-                          color: isUser ? Theme.of(context).colorScheme.primary : Theme.of(context).colorScheme.surfaceVariant,
-                          borderRadius: BorderRadius.circular(16),
-                        ),
-                        child: Text(
-                          m.content,
-                          style: TextStyle(
-                            color: isUser ? Theme.of(context).colorScheme.onPrimary : Theme.of(context).colorScheme.onSurfaceVariant,
-                            fontSize: 14,
+              final pending = _pending[m];
+              final scheme = Theme.of(context).colorScheme;
+
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Align(
+                    alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        if (!isUser) ...[
+                          const CircleAvatar(radius: 14, backgroundImage: AssetImage('icon.png')),
+                          const SizedBox(width: 8),
+                        ],
+                        Flexible(
+                          child: Container(
+                            margin: const EdgeInsets.symmetric(vertical: 4),
+                            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                            constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
+                            decoration: BoxDecoration(
+                              color: isUser ? scheme.primary : scheme.surfaceVariant,
+                              borderRadius: BorderRadius.circular(16),
+                            ),
+                            child: _RichChatText(
+                              text: m.content,
+                              markup: !isUser,
+                              style: TextStyle(
+                                color: isUser ? scheme.onPrimary : scheme.onSurfaceVariant,
+                                fontSize: 14,
+                              ),
+                            ),
                           ),
                         ),
+                      ],
+                    ),
+                  ),
+                  if (pending != null)
+                    Padding(
+                      padding: const EdgeInsets.only(left: 36, bottom: 6),
+                      child: Wrap(
+                        spacing: 8,
+                        children: [
+                          FilledButton.tonalIcon(
+                            icon: const Icon(Icons.check, size: 18),
+                            label: Text('Log ${widget.currency}${_money(pending.amount)}'),
+                            onPressed: () => _confirmPending(m),
+                          ),
+                          TextButton(onPressed: () => _cancelPending(m), child: const Text('Cancel')),
+                        ],
                       ),
                     ),
-                  ],
-                ),
+                ],
               );
             },
           ),
@@ -1325,6 +1618,7 @@ class AddOrEditTransactionDialog extends StatefulWidget {
 class _AddOrEditTransactionDialogState extends State<AddOrEditTransactionDialog> {
   late final TextEditingController _titleController;
   late final TextEditingController _amountController;
+  late final TextEditingController _noteController;
   late DateTime _selectedDate;
   List<Category> _categories = [];
   Category? _selectedCategory;
@@ -1335,13 +1629,23 @@ class _AddOrEditTransactionDialogState extends State<AddOrEditTransactionDialog>
     super.initState();
     _titleController = TextEditingController(text: widget.existing?.title ?? '');
     _amountController = TextEditingController(text: widget.existing != null ? widget.existing!.amount.toString() : '');
+    _noteController = TextEditingController(text: widget.existing?.note ?? '');
     _selectedDate = widget.existing?.date ?? DateTime.now();
     _paymentMethod = widget.existing?.paymentMethod ?? 'Cash';
     _fetchCategories();
   }
 
+  @override
+  void dispose() {
+    _titleController.dispose();
+    _amountController.dispose();
+    _noteController.dispose();
+    super.dispose();
+  }
+
   Future<void> _fetchCategories() async {
     final list = await AppDatabase.instance.getAllCategories();
+    if (!mounted) return;
     setState(() {
       _categories = list.where((c) => c.isExpense).toList();
       if (_categories.isNotEmpty) {
@@ -1371,17 +1675,22 @@ class _AddOrEditTransactionDialogState extends State<AddOrEditTransactionDialog>
 
   Future<void> _save() async {
     final title = _titleController.text.trim();
-    final amount = double.tryParse(_amountController.text.trim()) ?? 0.0;
+    final amount = double.tryParse(_amountController.text.trim().replaceAll(',', '')) ?? 0.0;
+    final noteText = _noteController.text.trim();
 
     if (title.isEmpty || amount <= 0 || _selectedCategory == null) return;
+
+    final timeSource = widget.existing?.date ?? DateTime.now();
+    final dateTime = DateTime(_selectedDate.year, _selectedDate.month, _selectedDate.day, timeSource.hour, timeSource.minute);
 
     if (widget.existing == null) {
       final tx = ExpenseTransaction(
         title: title,
         amount: amount,
-        date: _selectedDate,
+        date: dateTime,
         categoryId: _selectedCategory!.id!,
         paymentMethod: _paymentMethod,
+        note: noteText.isEmpty ? null : noteText,
       );
       await AppDatabase.instance.insertTransaction(tx);
     } else {
@@ -1389,9 +1698,10 @@ class _AddOrEditTransactionDialogState extends State<AddOrEditTransactionDialog>
         id: widget.existing!.id,
         title: title,
         amount: amount,
-        date: _selectedDate,
+        date: dateTime,
         categoryId: _selectedCategory!.id!,
         paymentMethod: _paymentMethod,
+        note: noteText.isEmpty ? null : noteText,
       );
       await AppDatabase.instance.updateTransaction(updated);
     }
@@ -1459,6 +1769,8 @@ class _AddOrEditTransactionDialogState extends State<AddOrEditTransactionDialog>
                 ),
               ],
             ),
+            const SizedBox(height: 12),
+            TextField(controller: _noteController, decoration: const InputDecoration(labelText: 'Note (optional)', border: OutlineInputBorder())),
             const SizedBox(height: 18),
             FilledButton.icon(
               onPressed: _save,
