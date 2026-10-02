@@ -234,7 +234,10 @@ class AppDatabase {
   }
 
   // ---- SQLite ----
-  Future<Database> get database => _dbFuture ??= _initDB('expense_tracker_v3.db');
+  Future<Database> get database => _dbFuture ??= _initDB('expense_tracker_v3.db').catchError((e) {
+    _dbFuture = null; // clear so the next call can retry
+    throw e;
+  });
 
   Future<Database> _initDB(String filePath) async {
     final dbPath = await getDatabasesPath();
@@ -826,7 +829,7 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
     }
 
     final csvData = buffer.toString();
-    if (!mounted) return;
+    if (!context.mounted) return;
 
     showDialog(
       context: context,
@@ -842,7 +845,7 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
               Container(
                 height: 180,
                 padding: const EdgeInsets.all(8),
-                color: Theme.of(context).colorScheme.surfaceVariant,
+                color: Theme.of(context).colorScheme.surfaceContainerHighest,
                 child: SingleChildScrollView(
                   child: Text(csvData, style: const TextStyle(fontFamily: 'monospace', fontSize: 11)),
                 ),
@@ -1194,14 +1197,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     contentPadding: EdgeInsets.zero,
                     onTap: () => widget.onEdit(tx),
                     leading: CircleAvatar(
-                      backgroundColor: Theme.of(context).colorScheme.surfaceVariant,
+                      backgroundColor: Theme.of(context).colorScheme.surfaceContainerHighest,
                       child: const Icon(Icons.receipt),
                     ),
                     title: Text(tx.title),
                     subtitle: Text(DateFormat('MMM dd, yyyy').format(tx.date)),
                     trailing: Text(
-                      '-${widget.currency}${_money(tx.amount)}',
-                      style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.redAccent),
+                      '${tx.isExpense ? '-' : '+'}${widget.currency}${_money(tx.amount)}',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        color: tx.isExpense ? Colors.redAccent : Colors.green[700],
+                      ),
                     ),
                   ),
                 )),
@@ -1292,8 +1298,11 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
                   title: Text(tx.title),
                   subtitle: Text('${DateFormat('MMM dd, yyyy').format(tx.date)} • ${tx.paymentMethod}'),
                   trailing: Text(
-                    '-${widget.currency}${_money(tx.amount)}',
-                    style: const TextStyle(color: Colors.redAccent, fontWeight: FontWeight.bold),
+                    '${tx.isExpense ? '-' : '+'}${widget.currency}${_money(tx.amount)}',
+                    style: TextStyle(
+                      color: tx.isExpense ? Colors.redAccent : Colors.green[700],
+                      fontWeight: FontWeight.bold,
+                    ),
                   ),
                 ),
               );
@@ -1528,14 +1537,14 @@ class _AiChatScreenState extends State<AiChatScreen> {
                             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                             constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
                             decoration: BoxDecoration(
-                              color: isUser ? scheme.primary : scheme.surfaceVariant,
+                              color: isUser ? scheme.primary : scheme.surfaceContainerHighest,
                               borderRadius: BorderRadius.circular(16),
                             ),
                             child: _RichChatText(
                               text: m.content,
                               markup: !isUser,
                               style: TextStyle(
-                                color: isUser ? scheme.onPrimary : scheme.onSurfaceVariant,
+                                color: isUser ? scheme.onPrimary : scheme.onSurface,
                                 fontSize: 14,
                               ),
                             ),
@@ -1623,6 +1632,11 @@ class _AddOrEditTransactionDialogState extends State<AddOrEditTransactionDialog>
   List<Category> _categories = [];
   Category? _selectedCategory;
   String _paymentMethod = 'Cash';
+  String _cardName = '';
+  List<String> _debitCards = [];
+  List<String> _creditCards = [];
+  bool _splitEnabled = false;
+  int _splitCount = 2;
 
   @override
   void initState() {
@@ -1631,8 +1645,18 @@ class _AddOrEditTransactionDialogState extends State<AddOrEditTransactionDialog>
     _amountController = TextEditingController(text: widget.existing != null ? widget.existing!.amount.toString() : '');
     _noteController = TextEditingController(text: widget.existing?.note ?? '');
     _selectedDate = widget.existing?.date ?? DateTime.now();
-    _paymentMethod = widget.existing?.paymentMethod ?? 'Cash';
+    final rawMethod = widget.existing?.paymentMethod ?? 'Cash';
+    if (rawMethod.startsWith('Debit Card - ')) {
+      _paymentMethod = 'Debit Card';
+      _cardName = rawMethod.substring('Debit Card - '.length);
+    } else if (rawMethod.startsWith('Credit Card - ')) {
+      _paymentMethod = 'Credit Card';
+      _cardName = rawMethod.substring('Credit Card - '.length);
+    } else {
+      _paymentMethod = rawMethod;
+    }
     _fetchCategories();
+    _loadKnownCards();
   }
 
   @override
@@ -1661,14 +1685,35 @@ class _AddOrEditTransactionDialogState extends State<AddOrEditTransactionDialog>
     });
   }
 
+  Future<void> _loadKnownCards() async {
+    final transactions = await AppDatabase.instance.getAllTransactions();
+    if (!mounted) return;
+    final debit = <String>{};
+    final credit = <String>{};
+    for (final tx in transactions) {
+      if (tx.paymentMethod.startsWith('Debit Card - ')) {
+        debit.add(tx.paymentMethod.substring('Debit Card - '.length));
+      } else if (tx.paymentMethod.startsWith('Credit Card - ')) {
+        credit.add(tx.paymentMethod.substring('Credit Card - '.length));
+      }
+    }
+    if (mounted) {
+      setState(() {
+        _debitCards = debit.toList()..sort();
+        _creditCards = credit.toList()..sort();
+      });
+    }
+  }
+
   void _pickDate() async {
+    final now = DateTime.now();
     final picked = await showDatePicker(
       context: context,
       initialDate: _selectedDate,
-      firstDate: DateTime(2020),
-      lastDate: DateTime(2030),
+      firstDate: DateTime(now.year - 5, now.month, now.day),
+      lastDate: DateTime(now.year + 1, 12, 31),
     );
-    if (picked != null) {
+    if (picked != null && mounted) {
       setState(() => _selectedDate = picked);
     }
   }
@@ -1680,33 +1725,39 @@ class _AddOrEditTransactionDialogState extends State<AddOrEditTransactionDialog>
 
     if (title.isEmpty || amount <= 0 || _selectedCategory == null) return;
 
+    // Apply split: save only the user's share
+    final effectiveAmount = _splitEnabled && _splitCount > 1 ? amount / _splitCount : amount;
+    final effectiveTitle = _splitEnabled && _splitCount > 1 ? '$title (÷$_splitCount)' : title;
+    final paymentMethod = (_paymentMethod == 'Debit Card' || _paymentMethod == 'Credit Card') && _cardName.trim().isNotEmpty
+        ? '$_paymentMethod - ${_cardName.trim()}'
+        : _paymentMethod;
+
+    final nav = Navigator.of(context);
     final timeSource = widget.existing?.date ?? DateTime.now();
     final dateTime = DateTime(_selectedDate.year, _selectedDate.month, _selectedDate.day, timeSource.hour, timeSource.minute);
 
     if (widget.existing == null) {
-      final tx = ExpenseTransaction(
-        title: title,
-        amount: amount,
+      await AppDatabase.instance.insertTransaction(ExpenseTransaction(
+        title: effectiveTitle,
+        amount: effectiveAmount,
         date: dateTime,
         categoryId: _selectedCategory!.id!,
-        paymentMethod: _paymentMethod,
+        paymentMethod: paymentMethod,
         note: noteText.isEmpty ? null : noteText,
-      );
-      await AppDatabase.instance.insertTransaction(tx);
+      ));
     } else {
-      final updated = ExpenseTransaction(
+      await AppDatabase.instance.updateTransaction(ExpenseTransaction(
         id: widget.existing!.id,
-        title: title,
-        amount: amount,
+        title: effectiveTitle,
+        amount: effectiveAmount,
         date: dateTime,
         categoryId: _selectedCategory!.id!,
-        paymentMethod: _paymentMethod,
+        paymentMethod: paymentMethod,
         note: noteText.isEmpty ? null : noteText,
-      );
-      await AppDatabase.instance.updateTransaction(updated);
+      ));
     }
 
-    if (mounted) Navigator.of(context).pop(true);
+    if (mounted) nav.pop(true);
   }
 
   @override
@@ -1738,6 +1789,87 @@ class _AddOrEditTransactionDialogState extends State<AddOrEditTransactionDialog>
               ),
             ),
             const SizedBox(height: 12),
+            // --- Split Expense Toggle ---
+            SwitchListTile.adaptive(
+              title: const Text('Split Expense'),
+              subtitle: const Text('Divide total equally among people'),
+              value: _splitEnabled,
+              onChanged: (v) => setState(() {
+                _splitEnabled = v;
+                if (!v) _splitCount = 2;
+              }),
+              contentPadding: EdgeInsets.zero,
+              dense: true,
+            ),
+            if (_splitEnabled) ...[
+              ValueListenableBuilder<TextEditingValue>(
+                valueListenable: _amountController,
+                builder: (context, amtValue, _) {
+                  final total = double.tryParse(amtValue.text.trim().replaceAll(',', '')) ?? 0.0;
+                  final share = _splitCount > 1 ? total / _splitCount : total;
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Row(
+                        children: [
+                          const Text('Split between:', style: TextStyle(fontWeight: FontWeight.w500)),
+                          const Spacer(),
+                          IconButton(
+                            icon: const Icon(Icons.remove_circle_outline),
+                            onPressed: _splitCount > 2 ? () => setState(() => _splitCount--) : null,
+                          ),
+                          Text(
+                            '$_splitCount people',
+                            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.add_circle_outline),
+                            onPressed: _splitCount < 20 ? () => setState(() => _splitCount++) : null,
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                        decoration: BoxDecoration(
+                          color: Theme.of(context).colorScheme.primaryContainer,
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text('Your share', style: TextStyle(fontSize: 12)),
+                                Text(
+                                  '${widget.currency}${_money(share)}',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 22,
+                                    color: Theme.of(context).colorScheme.primary,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            if (total > 0)
+                              Text(
+                                '${widget.currency}${_money(total)} ÷ $_splitCount',
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  color: Theme.of(context).colorScheme.onPrimaryContainer,
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                    ],
+                  );
+                },
+              ),
+            ],
+            const SizedBox(height: 12),
             if (_categories.isNotEmpty)
               DropdownButtonFormField<Category>(
                 value: _selectedCategory,
@@ -1758,7 +1890,10 @@ class _AddOrEditTransactionDialogState extends State<AddOrEditTransactionDialog>
                       DropdownMenuItem(value: 'Credit Card', child: Text('Credit Card')),
                       DropdownMenuItem(value: 'E-Wallet', child: Text('E-Wallet')),
                     ],
-                    onChanged: (v) => setState(() => _paymentMethod = v ?? 'Cash'),
+                    onChanged: (v) => setState(() {
+                      _paymentMethod = v ?? 'Cash';
+                      _cardName = '';
+                    }),
                   ),
                 ),
                 const SizedBox(width: 10),
@@ -1769,6 +1904,34 @@ class _AddOrEditTransactionDialogState extends State<AddOrEditTransactionDialog>
                 ),
               ],
             ),
+            if (_paymentMethod == 'Debit Card' || _paymentMethod == 'Credit Card') ...[
+              const SizedBox(height: 12),
+              Autocomplete<String>(
+                key: ValueKey(_paymentMethod),
+                initialValue: TextEditingValue(text: _cardName),
+                optionsBuilder: (TextEditingValue textEditingValue) {
+                  final known = _paymentMethod == 'Debit Card' ? _debitCards : _creditCards;
+                  if (textEditingValue.text.isEmpty) return known;
+                  return known
+                      .where((n) => n.toLowerCase().contains(textEditingValue.text.toLowerCase()))
+                      .toList();
+                },
+                onSelected: (String selection) => setState(() => _cardName = selection),
+                fieldViewBuilder: (context, controller, focusNode, onSubmitted) {
+                  return TextField(
+                    controller: controller,
+                    focusNode: focusNode,
+                    decoration: InputDecoration(
+                      labelText: '$_paymentMethod Name',
+                      hintText: 'e.g. BDO, BPI, Metrobank...',
+                      border: const OutlineInputBorder(),
+                      prefixIcon: const Icon(Icons.credit_card_outlined),
+                    ),
+                    onChanged: (v) => _cardName = v,
+                  );
+                },
+              ),
+            ],
             const SizedBox(height: 12),
             TextField(controller: _noteController, decoration: const InputDecoration(labelText: 'Note (optional)', border: OutlineInputBorder())),
             const SizedBox(height: 18),
