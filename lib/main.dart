@@ -223,11 +223,7 @@ class AppDatabase {
 
   Future<void> setSetting(String key, String value) async {
     final db = await database;
-    await db.insert(
-      'settings',
-      {'key': key, 'value': value},
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
+    await db.insert('settings', {'key': key, 'value': value}, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   Future<int> insertTransaction(ExpenseTransaction tx) async {
@@ -294,19 +290,14 @@ class AppDatabase {
 }
 
 // ==========================================
-// 3. ENHANCED AI ADVISOR & NATURAL LANGUAGE PARSER
+// 3. AI ADVISOR & NATURAL LANGUAGE PARSER
 // ==========================================
 
 class AiAdvisorService {
-  /// Result returned by AI: response text and whether an expense was logged
   static Future<Map<String, dynamic>> processUserMessage(String userQuery) async {
     final lower = userQuery.toLowerCase().trim();
 
-    // 1. Guardrail Check: Block off-topic queries immediately
-    final offTopicKeywords = [
-      'python', 'javascript', 'write code', 'who won', 'joke', 'weather',
-      'recipe', 'history', 'movie review', 'sports score', 'philosophy'
-    ];
+    final offTopicKeywords = ['python', 'javascript', 'write code', 'who won', 'joke', 'weather', 'recipe', 'history'];
     for (final word in offTopicKeywords) {
       if (lower.contains(word)) {
         return {
@@ -316,14 +307,11 @@ class AiAdvisorService {
       }
     }
 
-    // 2. Check for Natural Language Expense Logging:
-    // e.g., "spent 250 on pizza", "paid 1200 for electricity", "bought groceries 800", "lunch 150"
     final logMatch = _tryParseExpense(userQuery);
     if (logMatch != null) {
       final amount = logMatch['amount'] as double;
       final rawTitle = logMatch['title'] as String;
 
-      // Match category based on item title
       final categories = await AppDatabase.instance.getAllCategories();
       final category = _detectCategory(rawTitle, categories);
 
@@ -337,16 +325,12 @@ class AiAdvisorService {
 
       await AppDatabase.instance.insertTransaction(newTx);
 
-      // Re-fetch remaining budget to announce live update
       final currency = await AppDatabase.instance.getSetting('currency', '₱');
       final budgetStr = await AppDatabase.instance.getSetting('monthly_budget', '20000.0');
       final totalBudget = double.tryParse(budgetStr) ?? 20000.0;
 
       final now = DateTime.now();
-      final summary = await AppDatabase.instance.getCategorySpendingSummary(
-        DateTime(now.year, now.month, 1),
-        now,
-      );
+      final summary = await AppDatabase.instance.getCategorySpendingSummary(DateTime(now.year, now.month, 1), now);
       double totalSpent = 0;
       for (var row in summary) {
         totalSpent += (row['total_spent'] as num).toDouble();
@@ -363,7 +347,6 @@ class AiAdvisorService {
       };
     }
 
-    // 3. Daily Allowance Calculation
     if (lower.contains('daily') || lower.contains('allowance') || lower.contains('per day')) {
       final now = DateTime.now();
       final daysInMonth = DateTime(now.year, now.month + 1, 0).day;
@@ -373,10 +356,7 @@ class AiAdvisorService {
       final budgetStr = await AppDatabase.instance.getSetting('monthly_budget', '20000.0');
       final totalBudget = double.tryParse(budgetStr) ?? 20000.0;
 
-      final summary = await AppDatabase.instance.getCategorySpendingSummary(
-        DateTime(now.year, now.month, 1),
-        now,
-      );
+      final summary = await AppDatabase.instance.getCategorySpendingSummary(DateTime(now.year, now.month, 1), now);
       double totalSpent = 0;
       for (var row in summary) {
         totalSpent += (row['total_spent'] as num).toDouble();
@@ -394,15 +374,11 @@ class AiAdvisorService {
       };
     }
 
-    // 4. Highest Expense Check
     if (lower.contains('highest') || lower.contains('biggest')) {
       final currency = await AppDatabase.instance.getSetting('currency', '₱');
       final highest = await AppDatabase.instance.getHighestExpense();
       if (highest == null) {
-        return {
-          'text': "You haven't logged any expenses yet this month.",
-          'loggedExpense': false,
-        };
+        return {'text': "You haven't logged any expenses yet this month.", 'loggedExpense': false};
       }
       return {
         'text': "🔍 Your biggest expense so far is **${highest.title}** for **$currency${NumberFormat("#,##0.00").format(highest.amount)}** on ${DateFormat('MMM dd, yyyy').format(highest.date)}.",
@@ -410,21 +386,13 @@ class AiAdvisorService {
       };
     }
 
-    // 5. Category-Specific Spending Check
     final categories = await AppDatabase.instance.getAllCategories();
     for (var cat in categories) {
       if (lower.contains(cat.name.toLowerCase()) || (cat.name.contains('Food') && lower.contains('food'))) {
         final now = DateTime.now();
-        final summary = await AppDatabase.instance.getCategorySpendingSummary(
-          DateTime(now.year, now.month, 1),
-          now,
-        );
+        final summary = await AppDatabase.instance.getCategorySpendingSummary(DateTime(now.year, now.month, 1), now);
         final currency = await AppDatabase.instance.getSetting('currency', '₱');
-        final match = summary.firstWhere(
-          (m) => m['category_id'] == cat.id,
-          orElse: () => <String, dynamic>{},
-        );
-
+        final match = summary.firstWhere((m) => m['category_id'] == cat.id, orElse: () => <String, dynamic>{});
         final spent = match.isNotEmpty ? (match['total_spent'] as num).toDouble() : 0.0;
         return {
           'text': "📊 For **${cat.name}**, you have spent **$currency${NumberFormat("#,##0.00").format(spent)}** this month.",
@@ -433,16 +401,12 @@ class AiAdvisorService {
       }
     }
 
-    // 6. General Financial Summary & Affordability Advice
     final currency = await AppDatabase.instance.getSetting('currency', '₱');
     final budgetStr = await AppDatabase.instance.getSetting('monthly_budget', '20000.0');
     final totalBudget = double.tryParse(budgetStr) ?? 20000.0;
 
     final now = DateTime.now();
-    final summary = await AppDatabase.instance.getCategorySpendingSummary(
-      DateTime(now.year, now.month, 1),
-      now,
-    );
+    final summary = await AppDatabase.instance.getCategorySpendingSummary(DateTime(now.year, now.month, 1), now);
     double totalSpent = 0;
     final categoryLines = <String>[];
     for (var row in summary) {
@@ -475,18 +439,14 @@ class AiAdvisorService {
     };
   }
 
-  /// Parses text like: "spent 250 on lunch", "paid 1200 for electricity", "groceries 500"
   static Map<String, dynamic>? _tryParseExpense(String text) {
     final cleaned = text.trim();
-
-    // Pattern 1: spent/paid/bought 250 on/for pizza
     final r1 = RegExp(r'(?:spent|paid|bought|add)\s+(?:[₱\$€£₹])?\s*([0-9]+(?:\.[0-9]+)?)\s+(?:on|for)\s+(.+)', caseSensitive: false);
     final m1 = r1.firstMatch(cleaned);
     if (m1 != null) {
       return {'amount': double.parse(m1.group(1)!), 'title': m1.group(2)!.trim()};
     }
 
-    // Pattern 2: pizza 250 / lunch for 150
     final r2 = RegExp(r'(.+?)\s+(?:for|cost|was)?\s*(?:[₱\$€£₹])?\s*([0-9]+(?:\.[0-9]+)?)$', caseSensitive: false);
     final m2 = r2.firstMatch(cleaned);
     if (m2 != null) {
@@ -496,25 +456,23 @@ class AiAdvisorService {
         return {'amount': double.parse(m2.group(2)!), 'title': possibleTitle};
       }
     }
-
     return null;
   }
 
-  /// Matches item title keywords to categories
   static Category _detectCategory(String title, List<Category> categories) {
     final t = title.toLowerCase();
-    int targetIcon = 0xe532; // Default Food
+    int targetIcon = 0xe532;
 
     if (t.contains('grocer') || t.contains('market') || t.contains('milk') || t.contains('egg') || t.contains('meat') || t.contains('fruit') || t.contains('veg')) {
-      targetIcon = 0xe3ab; // Groceries
+      targetIcon = 0xe3ab;
     } else if (t.contains('taxi') || t.contains('bus') || t.contains('fare') || t.contains('gas') || t.contains('fuel') || t.contains('train') || t.contains('grab') || t.contains('angkas') || t.contains('car')) {
-      targetIcon = 0xe1d7; // Transportation
+      targetIcon = 0xe1d7;
     } else if (t.contains('bill') || t.contains('electric') || t.contains('water') || t.contains('internet') || t.contains('wifi') || t.contains('phone') || t.contains('rent')) {
-      targetIcon = 0xe56c; // Utilities
+      targetIcon = 0xe56c;
     } else if (t.contains('movie') || t.contains('game') || t.contains('netflix') || t.contains('concert') || t.contains('party') || t.contains('drink')) {
-      targetIcon = 0xe40f; // Entertainment
+      targetIcon = 0xe40f;
     } else if (t.contains('med') || t.contains('doctor') || t.contains('drug') || t.contains('clinic') || t.contains('health') || t.contains('hospital')) {
-      targetIcon = 0xe3e3; // Health
+      targetIcon = 0xe3e3;
     }
 
     return categories.firstWhere(
@@ -714,18 +672,25 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(_currentIndex == 0 ? 'Monthly Overview' : _currentIndex == 1 ? 'Transactions' : 'Penny (Offline AI)'),
+        // ==========================================================
+        // HIGHLIGHT: Custom Avatar Icon in the Top Bar (AI Tab)
+        // ==========================================================
+        title: Row(
+          children: [
+            if (_currentIndex == 2) ...[
+              const CircleAvatar(radius: 14, backgroundImage: AssetImage('icon.png')),
+              const SizedBox(width: 8),
+            ],
+            Text(_currentIndex == 0 ? 'Monthly Overview' : _currentIndex == 1 ? 'Transactions' : 'Penny (Your AI)'),
+          ],
+        ),
         actions: [
           IconButton(
             icon: Text(widget.currency, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
             tooltip: 'Change Currency',
             onPressed: _showCurrencySelector,
           ),
-          IconButton(
-            icon: const Icon(Icons.download),
-            tooltip: 'Export CSV',
-            onPressed: _exportCSV,
-          ),
+          IconButton(icon: const Icon(Icons.download), tooltip: 'Export CSV', onPressed: _exportCSV),
           IconButton(
             icon: Icon(Theme.of(context).brightness == Brightness.dark ? Icons.light_mode : Icons.dark_mode),
             tooltip: 'Toggle Dark/Light Mode',
@@ -747,7 +712,14 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
         destinations: const [
           NavigationDestination(icon: Icon(Icons.dashboard_outlined), selectedIcon: Icon(Icons.dashboard), label: 'Dashboard'),
           NavigationDestination(icon: Icon(Icons.receipt_long_outlined), selectedIcon: Icon(Icons.receipt_long), label: 'Transactions'),
-          NavigationDestination(icon: Icon(Icons.smart_toy_outlined), selectedIcon: Icon(Icons.smart_toy), label: 'AI Advisor'),
+          // ==========================================================
+          // HIGHLIGHT: Custom Avatar Icon in Bottom Navigation Bar
+          // ==========================================================
+          NavigationDestination(
+            icon: CircleAvatar(radius: 12, backgroundImage: AssetImage('icon.png')),
+            selectedIcon: CircleAvatar(radius: 12, backgroundImage: AssetImage('icon.png')),
+            label: 'Penny AI',
+          ),
         ],
       ),
     );
@@ -1158,7 +1130,7 @@ class _AiChatScreenState extends State<AiChatScreen> {
     if (mounted) {
       setState(() { _messages.add(aiMsg); _busy = false; });
       if (didLog) {
-        widget.onExpenseLogged(); // Live update the dashboard and transaction list!
+        widget.onExpenseLogged();
       }
     }
   }
@@ -1208,27 +1180,56 @@ class _AiChatScreenState extends State<AiChatScreen> {
               final isUser = m.sender == ChatSender.user;
               return Align(
                 alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
-                child: Container(
-                  margin: const EdgeInsets.symmetric(vertical: 4),
-                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                  constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.8),
-                  decoration: BoxDecoration(
-                    color: isUser ? Theme.of(context).colorScheme.primary : Theme.of(context).colorScheme.surfaceVariant,
-                    borderRadius: BorderRadius.circular(16),
-                  ),
-                  child: Text(
-                    m.content,
-                    style: TextStyle(
-                      color: isUser ? Theme.of(context).colorScheme.onPrimary : Theme.of(context).colorScheme.onSurfaceVariant,
-                      fontSize: 14,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // ==========================================================
+                    // HIGHLIGHT: Custom Avatar Icon next to Penny's Responses
+                    // ==========================================================
+                    if (!isUser) ...[
+                      const CircleAvatar(
+                        radius: 14,
+                        backgroundImage: AssetImage('icon.png'),
+                      ),
+                      const SizedBox(width: 8),
+                    ],
+                    Flexible(
+                      child: Container(
+                        margin: const EdgeInsets.symmetric(vertical: 4),
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                        constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
+                        decoration: BoxDecoration(
+                          color: isUser ? Theme.of(context).colorScheme.primary : Theme.of(context).colorScheme.surfaceVariant,
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                        child: Text(
+                          m.content,
+                          style: TextStyle(
+                            color: isUser ? Theme.of(context).colorScheme.onPrimary : Theme.of(context).colorScheme.onSurfaceVariant,
+                            fontSize: 14,
+                          ),
+                        ),
+                      ),
                     ),
-                  ),
+                  ],
                 ),
               );
             },
           ),
         ),
-        if (_busy) const Padding(padding: EdgeInsets.all(8), child: Text('Penny is thinking...', style: TextStyle(fontSize: 12))),
+        if (_busy)
+          const Padding(
+            padding: EdgeInsets.all(8),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                CircleAvatar(radius: 8, backgroundImage: AssetImage('icon.png')),
+                SizedBox(width: 8),
+                Text('Penny is thinking...', style: TextStyle(fontSize: 12)),
+              ],
+            ),
+          ),
         SafeArea(
           child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
