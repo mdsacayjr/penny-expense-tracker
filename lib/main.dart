@@ -24,6 +24,25 @@ Future<void> main() async {
 
 String _money(double v) => NumberFormat('#,##0.00').format(v);
 
+/// Parsed data from a split-expense note prefix like `[split:2:200.00]extra note`.
+class _SplitInfo {
+  final int count;
+  final double originalAmount;
+  final String? userNote;
+  const _SplitInfo({required this.count, required this.originalAmount, this.userNote});
+}
+
+/// Returns [_SplitInfo] when a split prefix is present in [note], otherwise null.
+_SplitInfo? _parseSplitNote(String? note) {
+  if (note == null) return null;
+  final match = RegExp(r'^\[split:(\d+):([\d.]+)\](.*)$', dotAll: true).firstMatch(note);
+  if (match == null) return null;
+  final count = int.tryParse(match.group(1)!) ?? 0;
+  final original = double.tryParse(match.group(2)!) ?? 0.0;
+  final rest = match.group(3)!.trim();
+  return _SplitInfo(count: count, originalAmount: original, userNote: rest.isEmpty ? null : rest);
+}
+
 /// Half-open range [start of month, start of next month).
 DateTimeRange monthRange(DateTime ref) => DateTimeRange(
       start: DateTime(ref.year, ref.month, 1),
@@ -905,7 +924,7 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
         ],
       ),
       body: IndexedStack(index: _currentIndex, children: screens),
-      floatingActionButton: _currentIndex != 2
+      floatingActionButton: _currentIndex == 0
           ? FloatingActionButton.extended(
               onPressed: () => _openAddTransactionModal(),
               icon: const Icon(Icons.add),
@@ -1167,8 +1186,43 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 ),
               ),
             ),
+            const SizedBox(height: 14),
+            // --- Legend ---
+            Wrap(
+              spacing: 12,
+              runSpacing: 8,
+              children: _summary.map((item) {
+                final colorVal = item['color'] as int;
+                final name = item['category_name'] as String;
+                final spent = (item['total_spent'] as num).toDouble();
+                return Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 12,
+                      height: 12,
+                      decoration: BoxDecoration(
+                        color: Color(colorVal),
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      name,
+                      style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500),
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      '${widget.currency}${_money(spent)}',
+                      style: TextStyle(fontSize: 11, color: Theme.of(context).colorScheme.outline),
+                    ),
+                  ],
+                );
+              }).toList(),
+            ),
             const SizedBox(height: 20),
           ],
+
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
@@ -1193,23 +1247,54 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     child: const Icon(Icons.delete, color: Colors.white),
                   ),
                   onDismissed: (_) => _deleteWithUndo(tx),
-                  child: ListTile(
-                    contentPadding: EdgeInsets.zero,
-                    onTap: () => widget.onEdit(tx),
-                    leading: CircleAvatar(
-                      backgroundColor: Theme.of(context).colorScheme.surfaceContainerHighest,
-                      child: const Icon(Icons.receipt),
-                    ),
-                    title: Text(tx.title),
-                    subtitle: Text(DateFormat('MMM dd, yyyy').format(tx.date)),
-                    trailing: Text(
-                      '${tx.isExpense ? '-' : '+'}${widget.currency}${_money(tx.amount)}',
-                      style: TextStyle(
-                        fontWeight: FontWeight.bold,
-                        color: tx.isExpense ? Colors.redAccent : Colors.green[700],
+                  child: Builder(builder: (context) {
+                    final split = _parseSplitNote(tx.note);
+                    return ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      onTap: () => widget.onEdit(tx),
+                      leading: CircleAvatar(
+                        backgroundColor: Theme.of(context).colorScheme.surfaceContainerHighest,
+                        child: const Icon(Icons.receipt),
                       ),
-                    ),
-                  ),
+                      title: Text(tx.title),
+                      subtitle: split != null
+                          ? Row(children: [
+                              Text(DateFormat('MMM dd, yyyy').format(tx.date)),
+                              const SizedBox(width: 6),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                                decoration: BoxDecoration(
+                                  color: Theme.of(context).colorScheme.secondaryContainer,
+                                  borderRadius: BorderRadius.circular(4),
+                                ),
+                                child: Text('÷${split.count}', style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
+                              ),
+                            ])
+                          : Text(DateFormat('MMM dd, yyyy').format(tx.date)),
+                      trailing: split != null
+                          ? Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              crossAxisAlignment: CrossAxisAlignment.end,
+                              children: [
+                                Text(
+                                  '-${widget.currency}${_money(tx.amount)}',
+                                  style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.redAccent, fontSize: 14),
+                                ),
+                                Text(
+                                  'of ${widget.currency}${_money(split.originalAmount)}',
+                                  style: TextStyle(fontSize: 10, color: Theme.of(context).colorScheme.outline),
+                                ),
+                              ],
+                            )
+                          : Text(
+                              '${tx.isExpense ? '-' : '+'}${widget.currency}${_money(tx.amount)}',
+                              style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                color: tx.isExpense ? Colors.redAccent : Colors.green[700],
+                              ),
+                            ),
+                    );
+                  }),
                 )),
           const SizedBox(height: 60),
         ],
@@ -1237,6 +1322,10 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
   List<ExpenseTransaction> _transactions = [];
   bool _loading = true;
 
+  // --- Multi-select state ---
+  final Set<int> _selectedIds = {};
+  bool get _isSelecting => _selectedIds.isNotEmpty;
+
   @override
   void initState() {
     super.initState();
@@ -1254,7 +1343,10 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
   }
 
   Future<void> _deleteWithUndo(ExpenseTransaction tx) async {
-    setState(() => _transactions.removeWhere((t) => t.id == tx.id));
+    setState(() {
+      _transactions.removeWhere((t) => t.id == tx.id);
+      _selectedIds.remove(tx.id);
+    });
     await AppDatabase.instance.deleteTransaction(tx.id!);
     widget.onChanged();
     if (!mounted) return;
@@ -1272,17 +1364,144 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
       ));
   }
 
+  void _toggleSelect(int id) {
+    setState(() {
+      if (_selectedIds.contains(id)) {
+        _selectedIds.remove(id);
+      } else {
+        _selectedIds.add(id);
+      }
+    });
+  }
+
+  void _clearSelection() => setState(() => _selectedIds.clear());
+
+  /// Sum of stored amounts (split share already applied) for selected transactions.
+  double get _sumMyShare {
+    return _transactions
+        .where((tx) => _selectedIds.contains(tx.id) && tx.isExpense)
+        .fold(0.0, (acc, tx) => acc + tx.amount);
+  }
+
+  /// Sum of original (pre-split) amounts for selected transactions.
+  double get _sumFullTotal {
+    return _transactions
+        .where((tx) => _selectedIds.contains(tx.id) && tx.isExpense)
+        .fold(0.0, (acc, tx) {
+          final split = _parseSplitNote(tx.note);
+          return acc + (split?.originalAmount ?? tx.amount);
+        });
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_loading) return const Center(child: CircularProgressIndicator());
 
-    return _transactions.isEmpty
-        ? const Center(child: Text('No transactions yet.'))
-        : ListView.separated(
+    if (_transactions.isEmpty) {
+      return const Center(child: Text('No transactions yet.'));
+    }
+
+    final myShare = _sumMyShare;
+
+    return Column(
+      children: [
+        // --- Selection header bar ---
+        if (_isSelecting)
+          Container(
+            color: Theme.of(context).colorScheme.secondaryContainer,
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+            child: Row(
+              children: [
+                IconButton(
+                  icon: const Icon(Icons.close),
+                  onPressed: _clearSelection,
+                  tooltip: 'Clear selection',
+                ),
+                Text(
+                  '${_selectedIds.length} selected',
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+                ),
+                const Spacer(),
+                TextButton.icon(
+                  icon: const Icon(Icons.select_all, size: 18),
+                  label: const Text('All'),
+                  onPressed: () => setState(() {
+                    _selectedIds.addAll(_transactions.map((t) => t.id!));
+                  }),
+                ),
+              ],
+            ),
+          ),
+
+        // --- Transaction list ---
+        Expanded(
+          child: ListView.separated(
             itemCount: _transactions.length,
             separatorBuilder: (_, __) => const Divider(height: 1),
             itemBuilder: (context, i) {
               final tx = _transactions[i];
+              final isSelected = _selectedIds.contains(tx.id);
+              final split = _parseSplitNote(tx.note);
+
+              final tile = ListTile(
+                selected: isSelected,
+                selectedTileColor: Theme.of(context).colorScheme.primaryContainer.withOpacity(0.35),
+                onTap: () {
+                  if (_isSelecting) {
+                    _toggleSelect(tx.id!);
+                  } else {
+                    widget.onEdit(tx);
+                  }
+                },
+                onLongPress: () => _toggleSelect(tx.id!),
+                leading: _isSelecting
+                    ? Checkbox(
+                        value: isSelected,
+                        onChanged: (_) => _toggleSelect(tx.id!),
+                      )
+                    : null,
+                title: Row(children: [
+                  Expanded(child: Text(tx.title, overflow: TextOverflow.ellipsis)),
+                  if (split != null) ...[
+                    const SizedBox(width: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                      decoration: BoxDecoration(
+                        color: Theme.of(context).colorScheme.secondaryContainer,
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Text('÷${split.count}', style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
+                    ),
+                  ],
+                ]),
+                subtitle: Text('${DateFormat('MMM dd, yyyy').format(tx.date)} • ${tx.paymentMethod}'),
+                trailing: split != null
+                    ? Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: [
+                          Text(
+                            '-${widget.currency}${_money(tx.amount)}',
+                            style: const TextStyle(color: Colors.redAccent, fontWeight: FontWeight.bold, fontSize: 14),
+                          ),
+                          Text(
+                            'of ${widget.currency}${_money(split.originalAmount)}',
+                            style: TextStyle(fontSize: 10, color: Theme.of(context).colorScheme.outline),
+                          ),
+                        ],
+                      )
+                    : Text(
+                        '${tx.isExpense ? '-' : '+'}${widget.currency}${_money(tx.amount)}',
+                        style: TextStyle(
+                          color: tx.isExpense ? Colors.redAccent : Colors.green[700],
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+              );
+
+              // Disable swipe-to-delete while selecting
+              if (_isSelecting) return tile;
+
               return Dismissible(
                 key: Key('all_tx_${tx.id}'),
                 direction: DismissDirection.endToStart,
@@ -1293,23 +1512,84 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
                   child: const Icon(Icons.delete, color: Colors.white),
                 ),
                 onDismissed: (_) => _deleteWithUndo(tx),
-                child: ListTile(
-                  onTap: () => widget.onEdit(tx),
-                  title: Text(tx.title),
-                  subtitle: Text('${DateFormat('MMM dd, yyyy').format(tx.date)} • ${tx.paymentMethod}'),
-                  trailing: Text(
-                    '${tx.isExpense ? '-' : '+'}${widget.currency}${_money(tx.amount)}',
-                    style: TextStyle(
-                      color: tx.isExpense ? Colors.redAccent : Colors.green[700],
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ),
+                child: tile,
               );
             },
-          );
+          ),
+        ),
+
+        // --- Summary bottom bar ---
+        if (_isSelecting)
+          Container(
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.surface,
+              boxShadow: [BoxShadow(color: Colors.black26, blurRadius: 8, offset: const Offset(0, -2))],
+            ),
+            padding: const EdgeInsets.fromLTRB(20, 12, 20, 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '${_selectedIds.length} item${_selectedIds.length == 1 ? '' : 's'} selected',
+                  style: TextStyle(fontSize: 11, color: Theme.of(context).colorScheme.outline),
+                ),
+                const SizedBox(height: 8),
+                IntrinsicHeight(
+                  child: Row(
+                    children: [
+                      // My expense column
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text('My expense', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                            Text(
+                              '${widget.currency}${_money(myShare)}',
+                              style: TextStyle(
+                                fontSize: 20,
+                                fontWeight: FontWeight.bold,
+                                color: Theme.of(context).colorScheme.primary,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      // Vertical divider
+                      VerticalDivider(
+                        width: 24,
+                        thickness: 1,
+                        color: Theme.of(context).colorScheme.outlineVariant,
+                      ),
+                      // Total original column
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text('Total (original)', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                            Text(
+                              '${widget.currency}${_money(_sumFullTotal)}',
+                              style: const TextStyle(
+                                fontSize: 20,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.redAccent,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+      ],
+    );
   }
 }
+
 
 // ==========================================
 // 7. AI CHAT SCREEN (PENNY)
@@ -1642,8 +1922,20 @@ class _AddOrEditTransactionDialogState extends State<AddOrEditTransactionDialog>
   void initState() {
     super.initState();
     _titleController = TextEditingController(text: widget.existing?.title ?? '');
-    _amountController = TextEditingController(text: widget.existing != null ? widget.existing!.amount.toString() : '');
-    _noteController = TextEditingController(text: widget.existing?.note ?? '');
+
+    // Restore split state if editing an existing split transaction
+    final existingSplit = _parseSplitNote(widget.existing?.note);
+    if (existingSplit != null && widget.existing != null) {
+      // Amount field shows the original total, not the user's share
+      _amountController = TextEditingController(text: existingSplit.originalAmount.toString());
+      _splitEnabled = true;
+      _splitCount = existingSplit.count;
+      _noteController = TextEditingController(text: existingSplit.userNote ?? '');
+    } else {
+      _amountController = TextEditingController(text: widget.existing != null ? widget.existing!.amount.toString() : '');
+      _noteController = TextEditingController(text: widget.existing?.note ?? '');
+    }
+
     _selectedDate = widget.existing?.date ?? DateTime.now();
     final rawMethod = widget.existing?.paymentMethod ?? 'Cash';
     if (rawMethod.startsWith('Debit Card - ')) {
@@ -1725,9 +2017,16 @@ class _AddOrEditTransactionDialogState extends State<AddOrEditTransactionDialog>
 
     if (title.isEmpty || amount <= 0 || _selectedCategory == null) return;
 
-    // Apply split: save only the user's share
-    final effectiveAmount = _splitEnabled && _splitCount > 1 ? amount / _splitCount : amount;
-    final effectiveTitle = _splitEnabled && _splitCount > 1 ? '$title (÷$_splitCount)' : title;
+    // Apply split: save only the user's share, but encode original amount in note
+    final isSplit = _splitEnabled && _splitCount > 1;
+    final effectiveAmount = isSplit ? amount / _splitCount : amount;
+    // Keep original title (no ÷ suffix in title — info is in the note prefix instead)
+    final effectiveTitle = title;
+    // Encode split info as a prefix in the note: [split:N:originalAmount]
+    final splitPrefix = isSplit ? '[split:$_splitCount:${amount.toStringAsFixed(2)}]' : '';
+    final effectiveNote = isSplit
+        ? (noteText.isEmpty ? splitPrefix : '$splitPrefix$noteText')
+        : (noteText.isEmpty ? null : noteText);
     final paymentMethod = (_paymentMethod == 'Debit Card' || _paymentMethod == 'Credit Card') && _cardName.trim().isNotEmpty
         ? '$_paymentMethod - ${_cardName.trim()}'
         : _paymentMethod;
@@ -1743,7 +2042,7 @@ class _AddOrEditTransactionDialogState extends State<AddOrEditTransactionDialog>
         date: dateTime,
         categoryId: _selectedCategory!.id!,
         paymentMethod: paymentMethod,
-        note: noteText.isEmpty ? null : noteText,
+        note: effectiveNote,
       ));
     } else {
       await AppDatabase.instance.updateTransaction(ExpenseTransaction(
@@ -1753,7 +2052,7 @@ class _AddOrEditTransactionDialogState extends State<AddOrEditTransactionDialog>
         date: dateTime,
         categoryId: _selectedCategory!.id!,
         paymentMethod: paymentMethod,
-        note: noteText.isEmpty ? null : noteText,
+        note: effectiveNote,
       ));
     }
 
