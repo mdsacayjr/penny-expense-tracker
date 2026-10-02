@@ -141,7 +141,7 @@ class AppDatabase {
 
   Future<Database> get database async {
     if (_database != null) return _database!;
-    _database = await _initDB('expense_tracker_v2.db');
+    _database = await _initDB('expense_tracker_v3.db');
     return _database!;
   }
 
@@ -195,12 +195,10 @@ class AppDatabase {
 
     await db.execute('CREATE INDEX idx_tx_date ON transactions(date)');
 
-    // Default settings
     await db.insert('settings', {'key': 'monthly_budget', 'value': '20000.0'});
     await db.insert('settings', {'key': 'currency', 'value': '₱'});
     await db.insert('settings', {'key': 'dark_mode', 'value': '0'});
 
-    // Pre-populate default categories
     final defaultCategories = [
       {'name': 'Food & Dining', 'icon_code_point': 0xe532, 'color_value': 0xFFFF7043, 'monthly_budget': 5000.0, 'is_expense': 1},
       {'name': 'Groceries', 'icon_code_point': 0xe3ab, 'color_value': 0xFF66BB6A, 'monthly_budget': 4000.0, 'is_expense': 1},
@@ -216,13 +214,10 @@ class AppDatabase {
     }
   }
 
-  // Settings
   Future<String> getSetting(String key, String defaultValue) async {
     final db = await database;
     final res = await db.query('settings', where: 'key = ?', whereArgs: [key]);
-    if (res.isNotEmpty) {
-      return res.first['value'] as String;
-    }
+    if (res.isNotEmpty) return res.first['value'] as String;
     return defaultValue;
   }
 
@@ -235,7 +230,6 @@ class AppDatabase {
     );
   }
 
-  // Transactions CRUD
   Future<int> insertTransaction(ExpenseTransaction tx) async {
     final db = await database;
     return await db.insert('transactions', tx.toMap());
@@ -243,12 +237,7 @@ class AppDatabase {
 
   Future<int> updateTransaction(ExpenseTransaction tx) async {
     final db = await database;
-    return await db.update(
-      'transactions',
-      tx.toMap(),
-      where: 'id = ?',
-      whereArgs: [tx.id],
-    );
+    return await db.update('transactions', tx.toMap(), where: 'id = ?', whereArgs: [tx.id]);
   }
 
   Future<int> deleteTransaction(int id) async {
@@ -268,7 +257,6 @@ class AppDatabase {
     return maps.map((e) => Category.fromMap(e)).toList();
   }
 
-  // Chat
   Future<int> insertChatMessage(ChatMessage msg) async {
     final db = await database;
     return await db.insert('chat_messages', msg.toMap());
@@ -280,11 +268,11 @@ class AppDatabase {
     return maps.map((e) => ChatMessage.fromMap(e)).toList();
   }
 
-  // Analytics
   Future<List<Map<String, dynamic>>> getCategorySpendingSummary(DateTime start, DateTime end) async {
     final db = await database;
     return await db.rawQuery('''
       SELECT 
+        c.id AS category_id,
         c.name AS category_name,
         c.monthly_budget AS budget,
         c.color_value AS color,
@@ -297,70 +285,242 @@ class AppDatabase {
     ''', [start.millisecondsSinceEpoch, end.millisecondsSinceEpoch]);
   }
 
-  Future<String> buildFinancialContextForAI() async {
-    final now = DateTime.now();
-    final firstDay = DateTime(now.year, now.month, 1);
-    final summary = await getCategorySpendingSummary(firstDay, now);
-    final budgetStr = await getSetting('monthly_budget', '20000.0');
-    final currency = await getSetting('currency', '₱');
-    final totalBudget = double.tryParse(budgetStr) ?? 20000.0;
-
-    double totalSpent = 0;
-    final categoryLines = <String>[];
-
-    for (final row in summary) {
-      final name = row['category_name'];
-      final spent = (row['total_spent'] as num).toDouble();
-      totalSpent += spent;
-      categoryLines.add('- $name: $currency${spent.toStringAsFixed(2)}');
-    }
-
-    final remaining = totalBudget - totalSpent;
-
-    return '''
-[FINANCIAL SNAPSHOT]
-Monthly Target Budget: $currency${totalBudget.toStringAsFixed(2)}
-Month-to-Date Total Spent: $currency${totalSpent.toStringAsFixed(2)}
-Remaining Spending Money: $currency${remaining.toStringAsFixed(2)}
-Category Breakdown:
-${categoryLines.isEmpty ? "- No expenses recorded this month yet." : categoryLines.join('\n')}
-''';
+  Future<ExpenseTransaction?> getHighestExpense() async {
+    final db = await database;
+    final maps = await db.query('transactions', where: 'is_expense = 1', orderBy: 'amount DESC', limit: 1);
+    if (maps.isNotEmpty) return ExpenseTransaction.fromMap(maps.first);
+    return null;
   }
 }
 
 // ==========================================
-// 3. AI ADVISOR & GUARDRAILS
+// 3. ENHANCED AI ADVISOR & NATURAL LANGUAGE PARSER
 // ==========================================
 
 class AiAdvisorService {
-  static Future<String> generateAdvice(String userQuery) async {
-    final lower = userQuery.toLowerCase();
-    final offTopicKeywords = ['python', 'javascript', 'write code', 'who won', 'joke', 'weather', 'recipe', 'history'];
+  /// Result returned by AI: response text and whether an expense was logged
+  static Future<Map<String, dynamic>> processUserMessage(String userQuery) async {
+    final lower = userQuery.toLowerCase().trim();
 
+    // 1. Guardrail Check: Block off-topic queries immediately
+    final offTopicKeywords = [
+      'python', 'javascript', 'write code', 'who won', 'joke', 'weather',
+      'recipe', 'history', 'movie review', 'sports score', 'philosophy'
+    ];
     for (final word in offTopicKeywords) {
       if (lower.contains(word)) {
-        return "I am Penny, your dedicated offline expense assistant. I can only assist with your budget, transactions, and spending decisions.";
+        return {
+          'text': "I am Penny, your personal offline expense assistant. I am strictly dedicated to your budget, transactions, and money decisions.",
+          'loggedExpense': false,
+        };
       }
     }
 
-    final snapshot = await AppDatabase.instance.buildFinancialContextForAI();
-    final budgetStr = await AppDatabase.instance.getSetting('monthly_budget', '20000.0');
-    final currency = await AppDatabase.instance.getSetting('currency', '₱');
-    final budget = double.tryParse(budgetStr) ?? 20000.0;
+    // 2. Check for Natural Language Expense Logging:
+    // e.g., "spent 250 on pizza", "paid 1200 for electricity", "bought groceries 800", "lunch 150"
+    final logMatch = _tryParseExpense(userQuery);
+    if (logMatch != null) {
+      final amount = logMatch['amount'] as double;
+      final rawTitle = logMatch['title'] as String;
 
-    await Future.delayed(const Duration(milliseconds: 500));
+      // Match category based on item title
+      final categories = await AppDatabase.instance.getAllCategories();
+      final category = _detectCategory(rawTitle, categories);
 
-    if (lower.contains('budget') || lower.contains('remaining') || lower.contains('left')) {
-      return "Here is your monthly balance:\n\n$snapshot\nKeep an eye on your remaining amount to avoid overspending before the month ends!";
-    } else if (lower.contains('afford')) {
-      return "Based on your total budget of $currency${budget.toStringAsFixed(0)}:\n$snapshot\nIf this expense is a must-have, go ahead! If it's a want, consider waiting until next month to keep your savings intact.";
-    } else if (lower.contains('summary') || lower.contains('how much')) {
-      return "Here is your current spending overview:\n\n$snapshot";
-    } else if (lower.contains('save') || lower.contains('cut down')) {
-      return "To save more money, inspect your highest category listed above. Reducing discretionary spending by even 10% will protect your remaining budget balance.";
-    } else {
-      return "I've reviewed your spending records. You have your budget and transactions ready. What specific purchase or expense would you like to discuss?";
+      final newTx = ExpenseTransaction(
+        title: rawTitle[0].toUpperCase() + rawTitle.substring(1),
+        amount: amount,
+        date: DateTime.now(),
+        categoryId: category.id!,
+        paymentMethod: 'Cash',
+      );
+
+      await AppDatabase.instance.insertTransaction(newTx);
+
+      // Re-fetch remaining budget to announce live update
+      final currency = await AppDatabase.instance.getSetting('currency', '₱');
+      final budgetStr = await AppDatabase.instance.getSetting('monthly_budget', '20000.0');
+      final totalBudget = double.tryParse(budgetStr) ?? 20000.0;
+
+      final now = DateTime.now();
+      final summary = await AppDatabase.instance.getCategorySpendingSummary(
+        DateTime(now.year, now.month, 1),
+        now,
+      );
+      double totalSpent = 0;
+      for (var row in summary) {
+        totalSpent += (row['total_spent'] as num).toDouble();
+      }
+      final remaining = totalBudget - totalSpent;
+
+      return {
+        'text': "✅ **Expense Logged!**\n"
+            "• Item: **${newTx.title}**\n"
+            "• Amount: **$currency${amount.toStringAsFixed(2)}**\n"
+            "• Category: **${category.name}**\n\n"
+            "💰 Your remaining budget is now **$currency${NumberFormat("#,##0.00").format(remaining)}**.",
+        'loggedExpense': true,
+      };
     }
+
+    // 3. Daily Allowance Calculation
+    if (lower.contains('daily') || lower.contains('allowance') || lower.contains('per day')) {
+      final now = DateTime.now();
+      final daysInMonth = DateTime(now.year, now.month + 1, 0).day;
+      final daysLeft = (daysInMonth - now.day) + 1;
+
+      final currency = await AppDatabase.instance.getSetting('currency', '₱');
+      final budgetStr = await AppDatabase.instance.getSetting('monthly_budget', '20000.0');
+      final totalBudget = double.tryParse(budgetStr) ?? 20000.0;
+
+      final summary = await AppDatabase.instance.getCategorySpendingSummary(
+        DateTime(now.year, now.month, 1),
+        now,
+      );
+      double totalSpent = 0;
+      for (var row in summary) {
+        totalSpent += (row['total_spent'] as num).toDouble();
+      }
+      final remaining = totalBudget - totalSpent;
+      final dailyAllowance = remaining > 0 ? (remaining / daysLeft) : 0.0;
+
+      return {
+        'text': "📅 **Daily Allowance Breakdown:**\n\n"
+            "• Days remaining this month: **$daysLeft days**\n"
+            "• Total remaining money: **$currency${NumberFormat("#,##0.00").format(remaining)}**\n"
+            "• **Safe Daily Limit:** **$currency${NumberFormat("#,##0.00").format(dailyAllowance)} / day**\n\n"
+            "${remaining <= 0 ? "⚠️ You have exceeded your monthly budget! Try to pause discretionary spending." : "Stick to this daily amount to comfortably hit your monthly budget!"}",
+        'loggedExpense': false,
+      };
+    }
+
+    // 4. Highest Expense Check
+    if (lower.contains('highest') || lower.contains('biggest')) {
+      final currency = await AppDatabase.instance.getSetting('currency', '₱');
+      final highest = await AppDatabase.instance.getHighestExpense();
+      if (highest == null) {
+        return {
+          'text': "You haven't logged any expenses yet this month.",
+          'loggedExpense': false,
+        };
+      }
+      return {
+        'text': "🔍 Your biggest expense so far is **${highest.title}** for **$currency${NumberFormat("#,##0.00").format(highest.amount)}** on ${DateFormat('MMM dd, yyyy').format(highest.date)}.",
+        'loggedExpense': false,
+      };
+    }
+
+    // 5. Category-Specific Spending Check
+    final categories = await AppDatabase.instance.getAllCategories();
+    for (var cat in categories) {
+      if (lower.contains(cat.name.toLowerCase()) || (cat.name.contains('Food') && lower.contains('food'))) {
+        final now = DateTime.now();
+        final summary = await AppDatabase.instance.getCategorySpendingSummary(
+          DateTime(now.year, now.month, 1),
+          now,
+        );
+        final currency = await AppDatabase.instance.getSetting('currency', '₱');
+        final match = summary.firstWhere(
+          (m) => m['category_id'] == cat.id,
+          orElse: () => <String, dynamic>{},
+        );
+
+        final spent = match.isNotEmpty ? (match['total_spent'] as num).toDouble() : 0.0;
+        return {
+          'text': "📊 For **${cat.name}**, you have spent **$currency${NumberFormat("#,##0.00").format(spent)}** this month.",
+          'loggedExpense': false,
+        };
+      }
+    }
+
+    // 6. General Financial Summary & Affordability Advice
+    final currency = await AppDatabase.instance.getSetting('currency', '₱');
+    final budgetStr = await AppDatabase.instance.getSetting('monthly_budget', '20000.0');
+    final totalBudget = double.tryParse(budgetStr) ?? 20000.0;
+
+    final now = DateTime.now();
+    final summary = await AppDatabase.instance.getCategorySpendingSummary(
+      DateTime(now.year, now.month, 1),
+      now,
+    );
+    double totalSpent = 0;
+    final categoryLines = <String>[];
+    for (var row in summary) {
+      final name = row['category_name'];
+      final spent = (row['total_spent'] as num).toDouble();
+      totalSpent += spent;
+      categoryLines.add('• $name: $currency${NumberFormat("#,##0.00").format(spent)}');
+    }
+    final remaining = totalBudget - totalSpent;
+
+    if (lower.contains('afford')) {
+      return {
+        'text': "💡 **Affordability Advice:**\n\n"
+            "• Monthly Budget: **$currency${NumberFormat("#,##0.00").format(totalBudget)}**\n"
+            "• Current Remaining: **$currency${NumberFormat("#,##0.00").format(remaining)}**\n\n"
+            "${remaining > 2000 ? "You have room in your budget for essential needs, but make sure non-essential purchases don't consume your remaining buffer!" : "Your remaining budget is tight ($currency${NumberFormat("#,##0.00").format(remaining)}). Consider holding off on any extra purchases!"}",
+        'loggedExpense': false,
+      };
+    }
+
+    return {
+      'text': "📋 **Current Financial Snapshot:**\n\n"
+          "• Budget: **$currency${NumberFormat("#,##0.00").format(totalBudget)}**\n"
+          "• Total Spent: **$currency${NumberFormat("#,##0.00").format(totalSpent)}**\n"
+          "• Remaining: **$currency${NumberFormat("#,##0.00").format(remaining)}**\n\n"
+          "**Top Categories:**\n"
+          "${categoryLines.isEmpty ? "• No expenses logged yet." : categoryLines.join('\n')}\n\n"
+          "Tip: You can log an expense right here! Just type: *\"Spent 150 on coffee\"*.",
+      'loggedExpense': false,
+    };
+  }
+
+  /// Parses text like: "spent 250 on lunch", "paid 1200 for electricity", "groceries 500"
+  static Map<String, dynamic>? _tryParseExpense(String text) {
+    final cleaned = text.trim();
+
+    // Pattern 1: spent/paid/bought 250 on/for pizza
+    final r1 = RegExp(r'(?:spent|paid|bought|add)\s+(?:[₱\$€£₹])?\s*([0-9]+(?:\.[0-9]+)?)\s+(?:on|for)\s+(.+)', caseSensitive: false);
+    final m1 = r1.firstMatch(cleaned);
+    if (m1 != null) {
+      return {'amount': double.parse(m1.group(1)!), 'title': m1.group(2)!.trim()};
+    }
+
+    // Pattern 2: pizza 250 / lunch for 150
+    final r2 = RegExp(r'(.+?)\s+(?:for|cost|was)?\s*(?:[₱\$€£₹])?\s*([0-9]+(?:\.[0-9]+)?)$', caseSensitive: false);
+    final m2 = r2.firstMatch(cleaned);
+    if (m2 != null) {
+      final possibleTitle = m2.group(1)!.trim();
+      final nonTitles = ['summary', 'budget', 'afford', 'save', 'money', 'allowance', 'left', 'remaining', 'highest'];
+      if (!nonTitles.any((w) => possibleTitle.toLowerCase().contains(w))) {
+        return {'amount': double.parse(m2.group(2)!), 'title': possibleTitle};
+      }
+    }
+
+    return null;
+  }
+
+  /// Matches item title keywords to categories
+  static Category _detectCategory(String title, List<Category> categories) {
+    final t = title.toLowerCase();
+    int targetIcon = 0xe532; // Default Food
+
+    if (t.contains('grocer') || t.contains('market') || t.contains('milk') || t.contains('egg') || t.contains('meat') || t.contains('fruit') || t.contains('veg')) {
+      targetIcon = 0xe3ab; // Groceries
+    } else if (t.contains('taxi') || t.contains('bus') || t.contains('fare') || t.contains('gas') || t.contains('fuel') || t.contains('train') || t.contains('grab') || t.contains('angkas') || t.contains('car')) {
+      targetIcon = 0xe1d7; // Transportation
+    } else if (t.contains('bill') || t.contains('electric') || t.contains('water') || t.contains('internet') || t.contains('wifi') || t.contains('phone') || t.contains('rent')) {
+      targetIcon = 0xe56c; // Utilities
+    } else if (t.contains('movie') || t.contains('game') || t.contains('netflix') || t.contains('concert') || t.contains('party') || t.contains('drink')) {
+      targetIcon = 0xe40f; // Entertainment
+    } else if (t.contains('med') || t.contains('doctor') || t.contains('drug') || t.contains('clinic') || t.contains('health') || t.contains('hospital')) {
+      targetIcon = 0xe3e3; // Health
+    }
+
+    return categories.firstWhere(
+      (c) => c.iconCodePoint == targetIcon,
+      orElse: () => categories.firstWhere((c) => c.isExpense, orElse: () => categories.first),
+    );
   }
 }
 
@@ -417,18 +577,12 @@ class _OfflineExpenseAppState extends State<OfflineExpenseApp> {
       theme: ThemeData(
         useMaterial3: true,
         brightness: Brightness.light,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF1E88E5),
-          brightness: Brightness.light,
-        ),
+        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF1E88E5), brightness: Brightness.light),
       ),
       darkTheme: ThemeData(
         useMaterial3: true,
         brightness: Brightness.dark,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF1E88E5),
-          brightness: Brightness.dark,
-        ),
+        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF1E88E5), brightness: Brightness.dark),
       ),
       home: MainNavigationShell(currency: _currency),
     );
@@ -448,6 +602,12 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
   final GlobalKey<_DashboardScreenState> _dashboardKey = GlobalKey();
   final GlobalKey<_TransactionsScreenState> _txKey = GlobalKey();
 
+  void _refreshAll() {
+    _dashboardKey.currentState?.loadData();
+    _txKey.currentState?.load();
+    setState(() {});
+  }
+
   void _openAddTransactionModal([ExpenseTransaction? existing]) async {
     final result = await showModalBottomSheet<bool>(
       context: context,
@@ -457,9 +617,7 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
     );
 
     if (result == true) {
-      _dashboardKey.currentState?.loadData();
-      _txKey.currentState?.load();
-      setState(() {});
+      _refreshAll();
     }
   }
 
@@ -480,8 +638,7 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
                 if (selected) {
                   OfflineExpenseApp.of(context)?.updateCurrency(c);
                   Navigator.pop(ctx);
-                  _dashboardKey.currentState?.loadData();
-                  _txKey.currentState?.load();
+                  _refreshAll();
                 }
               },
             );
@@ -552,7 +709,7 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
     final screens = [
       DashboardScreen(key: _dashboardKey, currency: widget.currency, onEdit: _openAddTransactionModal),
       TransactionsScreen(key: _txKey, currency: widget.currency, onEdit: _openAddTransactionModal),
-      AiChatScreen(currency: widget.currency),
+      AiChatScreen(currency: widget.currency, onExpenseLogged: _refreshAll),
     ];
 
     return Scaffold(
@@ -598,7 +755,7 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
 }
 
 // ==========================================
-// 5. DASHBOARD SCREEN (WITH REMAINING BUDGET)
+// 5. DASHBOARD SCREEN
 // ==========================================
 
 class DashboardScreen extends StatefulWidget {
@@ -695,7 +852,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
       child: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          // Budget & Spending Card
           Card(
             elevation: 2,
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
@@ -723,10 +879,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             children: [
                               Text(
                                 '${widget.currency}${NumberFormat("#,##0").format(_monthlyBudget)}',
-                                style: TextStyle(
-                                  fontWeight: FontWeight.bold,
-                                  color: Theme.of(context).colorScheme.primary,
-                                ),
+                                style: TextStyle(fontWeight: FontWeight.bold, color: Theme.of(context).colorScheme.primary),
                               ),
                               const SizedBox(width: 4),
                               const Icon(Icons.edit, size: 14),
@@ -798,8 +951,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
             ),
           ),
           const SizedBox(height: 20),
-
-          // Pie Chart
           if (_summary.isNotEmpty) ...[
             Text('Spending by Category', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold)),
             const SizedBox(height: 12),
@@ -825,8 +976,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
             ),
             const SizedBox(height: 20),
           ],
-
-          // Recent Expenses
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
@@ -853,9 +1002,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   onDismissed: (_) async {
                     await AppDatabase.instance.deleteTransaction(tx.id!);
                     loadData();
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text('Deleted "${tx.title}"')),
-                    );
+                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Deleted "${tx.title}"')));
                   },
                   child: ListTile(
                     contentPadding: EdgeInsets.zero,
@@ -880,7 +1027,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
 }
 
 // ==========================================
-// 6. TRANSACTIONS SCREEN (EDIT & DELETE)
+// 6. TRANSACTIONS SCREEN
 // ==========================================
 
 class TransactionsScreen extends StatefulWidget {
@@ -932,9 +1079,7 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
                 onDismissed: (_) async {
                   await AppDatabase.instance.deleteTransaction(tx.id!);
                   load();
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(content: Text('Deleted "${tx.title}"')),
-                  );
+                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Deleted "${tx.title}"')));
                 },
                 child: ListTile(
                   onTap: () => widget.onEdit(tx),
@@ -952,12 +1097,14 @@ class _TransactionsScreenState extends State<TransactionsScreen> {
 }
 
 // ==========================================
-// 7. AI CHAT SCREEN
+// 7. AI CHAT SCREEN (PENNY)
 // ==========================================
 
 class AiChatScreen extends StatefulWidget {
   final String currency;
-  const AiChatScreen({super.key, required this.currency});
+  final VoidCallback onExpenseLogged;
+
+  const AiChatScreen({super.key, required this.currency, required this.onExpenseLogged});
 
   @override
   State<AiChatScreen> createState() => _AiChatScreenState();
@@ -982,7 +1129,9 @@ class _AiChatScreenState extends State<AiChatScreen> {
         _messages.add(
           ChatMessage(
             sender: ChatSender.assistant,
-            content: "Hello! I'm Penny, your offline expense assistant. Ask me about your spending, remaining budget, or whether you can afford an upcoming expense.",
+            content: "Hello! I'm Penny, your offline AI advisor.\n\n"
+                "• Ask me about your **budget, daily allowance, or spending**\n"
+                "• Or log an expense by typing: *\"Spent 150 on coffee\"*!",
             timestamp: DateTime.now(),
           ),
         );
@@ -999,11 +1148,19 @@ class _AiChatScreenState extends State<AiChatScreen> {
     setState(() { _messages.add(userMsg); _busy = true; });
     await AppDatabase.instance.insertChatMessage(userMsg);
 
-    final reply = await AiAdvisorService.generateAdvice(query);
+    final result = await AiAdvisorService.processUserMessage(query);
+    final reply = result['text'] as String;
+    final didLog = result['loggedExpense'] as bool;
+
     final aiMsg = ChatMessage(sender: ChatSender.assistant, content: reply, timestamp: DateTime.now());
     await AppDatabase.instance.insertChatMessage(aiMsg);
 
-    if (mounted) setState(() { _messages.add(aiMsg); _busy = false; });
+    if (mounted) {
+      setState(() { _messages.add(aiMsg); _busy = false; });
+      if (didLog) {
+        widget.onExpenseLogged(); // Live update the dashboard and transaction list!
+      }
+    }
   }
 
   @override
@@ -1016,21 +1173,27 @@ class _AiChatScreenState extends State<AiChatScreen> {
           child: Row(
             children: [
               ActionChip(
+                avatar: const Icon(Icons.today, size: 16),
+                label: const Text('Daily Allowance?'),
+                onPressed: () => _send('What is my safe daily allowance for the rest of the month?'),
+              ),
+              const SizedBox(width: 8),
+              ActionChip(
+                avatar: const Icon(Icons.star, size: 16),
+                label: const Text('Biggest Expense?'),
+                onPressed: () => _send('What was my highest expense so far?'),
+              ),
+              const SizedBox(width: 8),
+              ActionChip(
                 avatar: const Icon(Icons.account_balance_wallet, size: 16),
                 label: const Text('Remaining Budget?'),
                 onPressed: () => _send('How much money do I have remaining in my budget this month?'),
               ),
               const SizedBox(width: 8),
               ActionChip(
-                avatar: const Icon(Icons.summarize, size: 16),
-                label: const Text('Monthly Summary'),
-                onPressed: () => _send('Give me a full summary of my spending this month.'),
-              ),
-              const SizedBox(width: 8),
-              ActionChip(
-                avatar: const Icon(Icons.savings, size: 16),
-                label: const Text('How to save money?'),
-                onPressed: () => _send('Where can I cut down expenses this month?'),
+                avatar: const Icon(Icons.restaurant, size: 16),
+                label: const Text('Food Spending?'),
+                onPressed: () => _send('How much have I spent on food this month?'),
               ),
             ],
           ),
@@ -1048,7 +1211,7 @@ class _AiChatScreenState extends State<AiChatScreen> {
                 child: Container(
                   margin: const EdgeInsets.symmetric(vertical: 4),
                   padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                  constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.78),
+                  constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.8),
                   decoration: BoxDecoration(
                     color: isUser ? Theme.of(context).colorScheme.primary : Theme.of(context).colorScheme.surfaceVariant,
                     borderRadius: BorderRadius.circular(16),
@@ -1057,6 +1220,7 @@ class _AiChatScreenState extends State<AiChatScreen> {
                     m.content,
                     style: TextStyle(
                       color: isUser ? Theme.of(context).colorScheme.onPrimary : Theme.of(context).colorScheme.onSurfaceVariant,
+                      fontSize: 14,
                     ),
                   ),
                 ),
@@ -1064,7 +1228,7 @@ class _AiChatScreenState extends State<AiChatScreen> {
             },
           ),
         ),
-        if (_busy) const Padding(padding: EdgeInsets.all(8), child: Text('Penny is calculating...', style: TextStyle(fontSize: 12))),
+        if (_busy) const Padding(padding: EdgeInsets.all(8), child: Text('Penny is thinking...', style: TextStyle(fontSize: 12))),
         SafeArea(
           child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -1073,7 +1237,10 @@ class _AiChatScreenState extends State<AiChatScreen> {
                 Expanded(
                   child: TextField(
                     controller: _controller,
-                    decoration: const InputDecoration(hintText: 'Ask Penny about budget or spending...', border: InputBorder.none),
+                    decoration: const InputDecoration(
+                      hintText: 'e.g. "Spent 250 on pizza" or ask a question...',
+                      border: InputBorder.none,
+                    ),
                     onSubmitted: _send,
                   ),
                 ),
@@ -1183,16 +1350,8 @@ class _AddOrEditTransactionDialogState extends State<AddOrEditTransactionDialog>
     final isEditing = widget.existing != null;
 
     return Container(
-      padding: EdgeInsets.only(
-        left: 20,
-        right: 20,
-        top: 24,
-        bottom: MediaQuery.of(context).viewInsets.bottom + 24,
-      ),
-      decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.surface,
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
-      ),
+      padding: EdgeInsets.only(left: 20, right: 20, top: 24, bottom: MediaQuery.of(context).viewInsets.bottom + 24),
+      decoration: BoxDecoration(color: Theme.of(context).colorScheme.surface, borderRadius: const BorderRadius.vertical(top: Radius.circular(24))),
       child: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -1203,10 +1362,7 @@ class _AddOrEditTransactionDialogState extends State<AddOrEditTransactionDialog>
               style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 14),
-            TextField(
-              controller: _titleController,
-              decoration: const InputDecoration(labelText: 'Expense Name', border: OutlineInputBorder()),
-            ),
+            TextField(controller: _titleController, decoration: const InputDecoration(labelText: 'Expense Name', border: OutlineInputBorder())),
             const SizedBox(height: 12),
             TextField(
               controller: _amountController,
